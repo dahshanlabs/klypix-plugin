@@ -1,0 +1,38 @@
+{
+  "name": "klypix",
+  "displayName": "KLYPIX",
+  "version": "1.93.0",
+  "description": "One project. One shared understanding. Gives Claude the KLYPIX project brain over MCP: read and grow a project's brain.klypix (decisions, open questions, corrections, wired together as a canvas you can inspect), and coordinate with other agent sessions on this machine through declared intent, expected files, overlap warnings and handoff notes.",
+  "author": {
+    "name": "Dahshan Labs",
+    "url": "https://klypix.com"
+  },
+  "homepage": "https://klypix.com",
+  "repository": "https://github.com/dahshanlabs/klypix-plugin",
+  "license": "Apache-2.0",
+  "keywords": [
+    "klypix",
+    "project-brain",
+    "multi-agent",
+    "agent-coordination",
+    "handoff",
+    "decisions",
+    "canvas",
+    "mcp"
+  ],
+  "icon": "./assets/icon.png",
+  "documentationUrl": "https://github.com/dahshanlabs/klypix-plugin#readme",
+  "supportUrl": "https://github.com/dahshanlabs/klypix-mcp/issues",
+  "privacyPolicyUrl": "https://klypix.com/privacy",
+  "mcpServers": {
+    "klypix-canvas": {
+      "command": "npx",
+      "args": ["-y", "klypix-mcp@1.93.0"],
+      "env": {
+        "KLYPIX_PLUGIN": "1",
+        "KLYPIX_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",
+        "KLYPIX_VAULT": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "klypix",
+  "description": "The KLYPIX plugin for Claude Code, published by Dahshan Labs: a shared project brain and machine-local coordination between agent sessions.",
+  "owner": {
+    "name": "Dahshan Labs",
+    "url": "https://klypix.com"
+  },
+  "plugins": [
+    {
+      "name": "klypix",
+      "source": "./",
+      "description": "Read and grow a project's brain.klypix, and coordinate agent sessions on this machine through declared intent, expected files, overlap warnings and handoff notes.",
+      "category": "productivity"
+    }
+  ]
+}
