@@ -56,15 +56,14 @@ the project folder, or use the KLYPIX desktop app. In a project without a
 | `klypix:read-klypix` | read and reason over any `.klypix` canvas |
 | `klypix:write-klypix` | turn a plan, breakdown or checklist into a `.klypix` board |
 
-**MCP tools** (server `klypix-canvas`, 23 tools as of klypix-mcp 1.91.0):
+**MCP tools** (server `klypix-canvas`, 25 tools):
 `brain_sync`, `brain_ask`, `brain_note`, `brain_message`,
 `brain_message_receipt`, `brain_reopen`, `brain_challenge`, `brain_insights`,
 `brain_lens`, `brain_connect`, `brain_reconcile`, `brain_garden`,
 `brain_doctor`, `search_all_brains`, `project_map_context`, `project_map_scan`,
-`project_map_drift`, `list_canvases`, `read_canvas`, `search_canvases`,
-`create_canvas`, `add_to_canvas`, `canvas_view`.
-*(TO CONFIRM after 1.93.0: re-count the tools for 1.93.0 and update this
-list.)*
+`project_map_drift`, `list_canvases`, `read_canvas`, `read_card_contents`,
+`search_canvases`, `create_canvas`, `add_to_canvas`, `canvas_view`,
+`klypix_status`.
 
 ## Examples
 
@@ -80,11 +79,15 @@ list.)*
    writes a decision with `brain_note` and resolves the matching question.
 4. *"Turn this release plan into a board I can open in KLYPIX."* — Claude builds
    a grouped checklist with `create_canvas` and gives you the file path.
+5. *"Read the research board and summarise the PDF and the photos on it."* —
+   Claude reads the board with `read_canvas`, then calls `read_card_contents`
+   with the card ids to get the photos and the PDF's local path.
 
 ## What this plugin runs, reads, writes and sends
 
 This section lists everything the plugin does. It describes klypix-mcp running
-in **plugin mode**, which the plugin switches on by setting `KLYPIX_PLUGIN=1`.
+in **plugin mode**. Plugin mode is switched on only by `KLYPIX_PLUGIN=1`, which
+this plugin sets; it changes how the MCP server behaves and nothing else.
 
 ### What runs
 
@@ -94,19 +97,36 @@ in **plugin mode**, which the plugin switches on by setting `KLYPIX_PLUGIN=1`.
   use npm's cache. **klypix-mcp's own dependencies are resolved by npm at
   install time** within the version ranges klypix-mcp declares
   (`@modelcontextprotocol/sdk`, `@modelcontextprotocol/ext-apps`, `jszip`,
-  `zod`, `fractional-indexing`).
+  `jpeg-js`, `zod`, `fractional-indexing`).
 - The server is a small supervisor process plus one Node.js worker process. It
   talks to Claude Code over standard input and output only. **It opens no
   network port and runs no listener.**
 - The plugin passes three settings: `KLYPIX_PLUGIN=1` (plugin mode),
-  `KLYPIX_PLUGIN_DATA` (the plugin's data folder that Claude Code provides) and
-  `KLYPIX_VAULT` (the current project folder, used as the canvas folder).
-- In plugin mode the server **does not update itself**: it makes no automatic
-  npm checks, installs nothing in the background, and never loads or switches
-  to code in `~/.claude/project-brain`. New versions arrive only when this
-  plugin is updated with a new pinned version. *(TO CONFIRM after 1.93.0.)*
+  `KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` (the plugin's data folder) and
+  `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}` (the current project folder, used as the
+  canvas folder). A value that still reads `${...}` because it was never filled
+  in is ignored. Claude Code also passes `CLAUDE_PLUGIN_DATA` to the server
+  directly, so the data folder is found either way.
 - This plugin installs **no hooks**. Nothing runs at session start, on each
   prompt or at turn end except the server above.
+
+### What plugin mode never does
+
+- **Update itself.** It never asks npm for a newer release and never installs
+  one, whatever `KLYPIX_AUTO_UPDATE` is set to. You run the version this plugin
+  pins; a newer version reaches you only in a new plugin release.
+- **Run code from outside the package.** It runs only the worker inside the
+  pinned package. It never starts or switches to the copy that
+  `npx klypix-mcp install` puts in `~/.claude/project-brain`, and it never loads
+  the optional on-device semantic model, so search is keyword-only and no model
+  weights are downloaded.
+- **Write project config files.** It never creates or rewrites rules files,
+  editor MCP configs (`.mcp.json`, `.cursor/`, `.codex/config.toml` and the
+  rest) or the `AGENTS.md` brief block, in this project or any other.
+- **Change Claude's settings.** It never writes `~/.claude/settings.json`,
+  hooks, permissions or any other host configuration.
+- **Collect data or read credentials.** It sends no telemetry or usage data and
+  reads no API keys or tokens.
 
 ### What it asks Claude to do
 
@@ -126,98 +146,81 @@ Claude to:
 
 ### What it reads
 
-Only when one of its tools is called:
+- **In your project:** `brain.klypix`, the `.klypix` and `.any` canvases
+  (searched up to six folders deep), the `version` field of `package.json`, and
+  git information through read-only `git` commands (current branch, tags, log)
+  for coordination and release checks. Also any canvas file you point it at by
+  path; for the Project Map tools, the project's file list and an existing
+  `graphify-out/graph.json` or `klypix-map/graph.json`; and for `brain_note`
+  evidence, a hash of each project file you cite.
+- **Files inside a canvas:** `read_card_contents` reads the copies of files that
+  a saved canvas holds (see *Reading what is inside cards* below).
+- **On your computer:** the coordination files listed below; for
+  `search_all_brains`, the `brain.klypix` files of the projects in this
+  plugin's registry; and for `brain_doctor`, `~/.claude/settings.json` (read
+  only, to check whether KLYPIX's own hooks are present).
+- **The KLYPIX desktop app's data folder** (`%APPDATA%/klypix` on Windows),
+  read-only and only if the app is installed: to see whether the app is
+  running, which canvases it has open, and the readings it saved on cards.
 
-- `.klypix` and `.any` canvas files in the project folder (searched up to six
-  folders deep, at most 400 files), plus any canvas file you point it at by
-  path.
-- The project's `brain.klypix`.
-- Git information about the project, through read-only `git` commands
-  (`rev-parse`, `log`, `merge-base`, `tag --list`, `diff --name-only`), during
-  `brain_sync` and the reconcile, drift and doctor tools.
-- For the Project Map tools: the project's file list, and an existing
-  `graphify-out/graph.json` or `klypix-map/graph.json` inside the project.
-- For `brain_note` evidence: a hash of each project file you cite, so a later
-  change to that file can be noticed.
-- For `search_all_brains`: the `brain.klypix` files of other projects on this
-  machine that are listed in KLYPIX's local registry.
-- For `brain_doctor`: KLYPIX's own state files, and `~/.claude/settings.json`
-  and Codex's KLYPIX hook entries, to report whether KLYPIX's hooks are wired.
+It never reads chat history, transcripts or Claude's memory.
 
-It does not read Claude's memory or your chat history, and it does not use or
-send any credential. (`brain_doctor` opens `~/.claude/settings.json` only to
-look for KLYPIX's own hook entries.)
+### What it writes, and where
 
-### What it writes in your project
-
-Only when one of its tools is called:
-
-- `brain.klypix` — through `brain_note`, `add_to_canvas`, and the apply,
-  confirm or dismiss options of `brain_connect`, `brain_reconcile` and
-  `brain_garden`. Each write replaces the file atomically (write to a temporary
-  file, then rename), and KLYPIX keeps recent restore points of the brain.
-- New `.klypix` canvases from `create_canvas` (it picks a free name and never
-  overwrites a canvas), and cards added to a canvas you name with
-  `add_to_canvas`.
-- `.claude/brain-capture.lock`, a short-lived lock file held while the brain is
-  written.
-- `.claude/brain-ship-obs.json` and `.claude/brain-pending-ships.jsonl`, which
-  `brain_sync` uses at the start of a task to notice releases that nobody
-  recorded. *(TO CONFIRM after 1.93.0: whether plugin mode keeps these in the
-  project or moves them to the plugin data folder.)*
-- `klypix-map/graph.json`, only when you run `project_map_scan`.
-- `.klypix/claims/<owner>.json`, only when a release claim is made with
-  `publish: true` in `brain_sync`.
-
-In plugin mode it **never writes** agent instruction or configuration files —
-`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, editor rule files for Cursor, Cline,
-Windsurf or Copilot, `.mcp.json`, `.codex/config.toml` and similar — not from
-`brain_sync` and not from any daily maintenance pass. *(TO CONFIRM after 1.93.0.)*
-
-### What it keeps on this machine
-
-KLYPIX keeps machine-local coordination state so that sessions on this computer
-can see each other: which sessions are active on which project and what they
-declared, the notes waiting for each session, a registry of the projects that
-have a brain, recent restore points of each brain, a record of
-dismissed or confirmed reconcile hints, retrieval hints recorded by
-`brain_note`, and small caches.
-
-Today this state lives in `~/.claude/project-brain/`. In plugin mode, the
-plugin's own state is kept in the plugin data folder that Claude Code manages
-(`~/.claude/plugins/data/…`, removed when you uninstall the plugin). The shared
-session and message files stay in `~/.claude/project-brain/` so that plugin
-sessions and sessions in other tools (for example Codex) on the same machine
-can see each other. *(TO CONFIRM after 1.93.0: the exact split between the
-plugin data folder and `~/.claude/project-brain/`.)*
+| Where | What |
+|---|---|
+| Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain write tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none; the lock file is deleted after the write and the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. Brain writes replace the file atomically. `create_canvas` never overwrites an existing canvas, and `add_to_canvas` refuses a canvas that is open in KLYPIX (project brains excepted, because KLYPIX merges them). |
+| The plugin's data folder | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), the last version and git tag seen in each project (`ship-observations/`), and cached copies of card files handed to Claude (`extracted/`, at most 150 MB per file). Claude Code deletes this folder when you uninstall the plugin. |
+| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. These are shared **on purpose**: through them a plugin session and a session in another tool (Claude Code in a terminal, Codex, Cursor, the KLYPIX app) on the same project see each other, get overlap warnings and pass notes. Restore points stay here so a brain write can still be undone after the plugin is removed. |
 
 ### Dialogs and terminal windows
 
-- `brain_reopen` first asks you — with a Reopen / Not now prompt in chat where
-  Claude Code supports it, otherwise a native system dialog (PowerShell on
-  Windows, `osascript` on macOS, `zenity` or `kdialog` on Linux). Only if you
-  say yes does it open a new, visible terminal window in that session's folder
-  running `claude --resume <id>` or `codex resume <id>`. If you say no, or do
-  not answer, nothing opens. It only reopens Claude Code and Codex sessions
-  that have a note waiting.
+`brain_reopen` first asks you — with *Reopen* and *Not now* in chat where Claude
+Code supports it, otherwise a small native dialog (on Windows
+`powershell -NoProfile -NonInteractive -Command`, with no execution-policy
+bypass; `osascript` on macOS; `zenity` or `kdialog` on Linux). Only if you
+choose *Reopen* does it open a new, visible terminal window in that session's
+folder running `claude --resume <id>` or `codex resume <id>`. If you say no, or
+do not answer, nothing opens. It only reopens Claude Code and Codex sessions
+that have a note waiting.
 
 ### Network
 
+Plugin mode makes two kinds of request, and both go to the public npm registry:
+
 - **Package download:** npx fetches `klypix-mcp@1.93.0` and its dependencies
-  from the npm registry when the server first starts (and again only if npm's
-  cache no longer has them).
-- **Optional version check:** `brain_doctor` with `check_npm: true` runs
-  `npm view klypix-mcp version`, one request to the npm registry, only when
-  asked.
-- **Nothing else.** No telemetry or usage reporting, no account, no sign-in,
-  and no listener. The plugin never uploads your brain, canvases or notes. The
-  only content that leaves this machine is what Claude itself reads through
-  the tools as part of your conversation.
-- Optional on-device semantic search uses a separately installed model runtime
-  kept in `~/.claude/project-brain`; in plugin mode that runtime is not loaded,
-  so retrieval is keyword-based. *(TO CONFIRM after 1.93.0. Without plugin
-  mode, that runtime downloads two small models from Hugging Face on first
-  use.)*
+  when the plugin starts the server (and again only if npm's cache no longer
+  has them).
+- **Optional version check:** one `npm view klypix-mcp version`, only when
+  Claude calls `brain_doctor` with `check_npm: true`.
+
+There are no other requests: no telemetry, no account, no sign-in, no model
+downloads and no listener. The plugin never uploads your brain, canvases,
+notes or card files. The only content that leaves this machine is what Claude
+itself reads through the tools as part of your conversation.
+
+## Reading what is inside cards
+
+A canvas saved by KLYPIX keeps a copy of every file dropped on it.
+`read_canvas` prints every card with its id and an `Inside:` line for cards
+that hold something; `read_card_contents` (up to 5 card ids per call) hands
+those files to Claude as they are, so Claude reads them with its own model and
+file tools. KLYPIX extracts nothing itself here — no OCR, transcription or
+document-text extraction. This works with the KLYPIX app closed.
+
+| Card | What Claude gets |
+|---|---|
+| Text file | Its words, fenced as data (up to 48,000 characters per answer; a longer file is cut, marked, and also given as a local path). |
+| Photo | The photo itself. A photo too large for one answer comes as a smaller JPEG copy, re-encoded on your computer by the bundled pure-JavaScript `jpeg-js`, with the full-size original as a local path. |
+| PDF | A local path to a cached copy — Claude Code can open it — plus KLYPIX's saved image of page 1. |
+| Word, Excel, PowerPoint, other files | A local path to a cached copy, plus the preview KLYPIX saved (opening text, first rows). |
+| Folder | Its file list; pass `entry_paths` (up to 8) to get those files the same way. |
+| Audio, video | Only a reading KLYPIX already saved on the card (for example a transcript); otherwise a local path and a plain note that nothing says what it contains. |
+
+Readings KLYPIX saved on a card — transcripts, OCR results, *Read contents*
+cards — come back first. Cards inside a box a person locked from AI tools in
+KLYPIX are never read, copied or attached. Text from cards is fenced as data,
+never instructions.
 
 ## Limits
 
@@ -231,20 +234,30 @@ plugin data folder and `~/.claude/project-brain/`.)*
   brain when Claude calls `brain_note` (or another write tool). For automatic
   capture at the end of each Claude Code turn, use the full
   `npx klypix-mcp install` instead of this plugin.
+- **Search is keyword-only** in plugin mode; the on-device semantic model is
+  never loaded.
+- **Whole PDFs and Office files need a file tool.** They are handed over as a
+  local path. Claude Code opens them; Claude Desktop, which has no file tool of
+  its own, gets only KLYPIX's saved page-1 image or preview.
+- **Audio and video** are read only through a reading KLYPIX saved on the card,
+  so open the canvas in KLYPIX and use *Read contents* first. This version
+  starts no new readings.
+- **One answer stays under 1 MB** (Claude Desktop's limit), so large photos come
+  as smaller copies and at most 4 images come back per answer.
 - **Works without the desktop app.** Everything above works from Claude alone.
   To *see* and rearrange a canvas, open it in the
   [KLYPIX desktop app](https://klypix.com) (Windows, optional).
 - `canvas_view` returns a text summary and a layout description; do not expect
   a rendered board inside chat.
-- Retrieval is keyword-based in plugin mode (see Network above). *(TO CONFIRM
-  after 1.93.0.)*
 
 ## Uninstall
 
-Remove the plugin from `/plugin`. Claude Code deletes the plugin's data folder.
-Your `brain.klypix` and canvases stay in your projects. KLYPIX state in
-`~/.claude/project-brain/` (if any) is not removed by uninstalling the plugin;
-you can delete that folder yourself. *(TO CONFIRM after 1.93.0.)*
+Remove the plugin from `/plugin`. Claude Code removes the plugin and deletes its
+data folder (including cached card files). These stay: your brain and
+canvases, which belong to you; any `.claude/` folder a brain write created in a
+project; and the presence lanes, write locks and restore points in
+`~/.claude/project-brain`. Other KLYPIX tools on this computer share that
+folder; if you use none, you can delete it.
 
 ## Privacy, support and source
 

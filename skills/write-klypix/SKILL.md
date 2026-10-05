@@ -86,6 +86,10 @@ Pass `canvas` (title, filename or absolute path), `cards`, and optional
 right. Connections may point at new cards (by index or title) or at existing
 cards (by their exact title — read the canvas first with `read_canvas`).
 
+`add_to_canvas` refuses, and writes nothing, when the canvas is open in KLYPIX
+(close its tab first; project brains are the exception), when the target box is
+locked from AI tools, or when it is frozen. Pass the refusal on to the user.
+
 For the project's own `brain.klypix`, prefer the `project-brain` skill and
 `brain_note`, which handle supersession and resolution.
 
