@@ -179,7 +179,7 @@ Windsurf or Copilot, `.mcp.json`, `.codex/config.toml` and similar — not from
 KLYPIX keeps machine-local coordination state so that sessions on this computer
 can see each other: which sessions are active on which project and what they
 declared, the notes waiting for each session, a registry of the projects that
-have a brain, restore points taken before each brain write, a record of
+have a brain, recent restore points of each brain, a record of
 dismissed or confirmed reconcile hints, retrieval hints recorded by
 `brain_note`, and small caches.
 
@@ -191,7 +191,7 @@ sessions and sessions in other tools (for example Codex) on the same machine
 can see each other. *(TO CONFIRM after 1.93.0: the exact split between the
 plugin data folder and `~/.claude/project-brain/`.)*
 
-### Windows, terminals and dialogs
+### Dialogs and terminal windows
 
 - `brain_reopen` first asks you — with a Reopen / Not now prompt in chat where
   Claude Code supports it, otherwise a native system dialog (PowerShell on
