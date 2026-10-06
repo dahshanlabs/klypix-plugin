@@ -103,12 +103,11 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
   port and runs no listener.** On Windows it can connect, as a client, to the
   KLYPIX desktop app's local pipe while the app is open (see *With the KLYPIX
   app open* below).
-- The plugin passes three settings: `KLYPIX_PLUGIN=1` (plugin mode),
-  `KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` (the plugin's data folder) and
-  `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}` (the current project folder, used as the
-  canvas folder). A value that still reads `${...}` because it was never filled
-  in is ignored. Claude Code also passes `CLAUDE_PLUGIN_DATA` to the server
-  directly, so the data folder is found either way.
+- The plugin sets three values: `KLYPIX_PLUGIN` to `1` (plugin mode),
+  `KLYPIX_PLUGIN_DATA` to the plugin's data folder that Claude Code manages, and
+  `KLYPIX_VAULT` to the current project folder (used as the canvas folder).
+  A value Claude Code did not fill in is ignored, and Claude Code also hands
+  the data folder to the server directly, so it is found either way.
 - This plugin installs **no hooks**. Nothing runs at session start, on each
   prompt or at turn end except the server above.
 
@@ -139,7 +138,7 @@ Claude to:
   `brain.klypix` (with the project folder, a one-sentence intent and the files
   it expects to touch), again when its file scope changes, and with
   `phase: "complete"` before its final answer;
-- use `brain_message` to pass notes between agent sessions on this machine,
+- use `brain_message` to send notes between agent sessions on this machine,
   instead of asking you to copy text from one session to another, and to offer
   `brain_reopen` if you want a closed session to pick up a note sooner;
 - record only durable decisions or milestones with `brain_note`;
@@ -173,7 +172,7 @@ It never reads chat history, transcripts or Claude's memory.
 |---|---|
 | Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain write tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none; the lock file is deleted after the write and the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. Brain writes replace the file atomically. `create_canvas` never overwrites an existing canvas, and `add_to_canvas` refuses a canvas that is open in KLYPIX (project brains excepted, because KLYPIX merges them). |
 | The plugin's data folder | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), the last version and git tag seen in each project (`ship-observations/`), and cached copies of card files handed to Claude (`extracted/`, at most 150 MB per file). Claude Code deletes this folder when you uninstall the plugin. |
-| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. These are shared **on purpose**: through them a plugin session and a session in another tool (Claude Code in a terminal, Codex, Cursor, the KLYPIX app) on the same project see each other, get overlap warnings and pass notes. Restore points stay here so a brain write can still be undone after the plugin is removed. |
+| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. These are shared **on purpose**: through them a plugin session and a session in another tool (Claude Code in a terminal, Codex, Cursor, the KLYPIX app) on the same project see each other, get overlap warnings and send notes. Restore points stay here so a brain write can still be undone after the plugin is removed. |
 
 ### With the KLYPIX app open (Windows)
 
@@ -246,7 +245,7 @@ document-text extraction. This works with the KLYPIX app closed.
 | Photo | The photo itself. A photo too large for one answer comes as a smaller JPEG copy, re-encoded on your computer by the bundled pure-JavaScript `jpeg-js`, with the full-size original as a local path. |
 | PDF | A local path to a cached copy — Claude Code can open it — plus KLYPIX's saved image of page 1. |
 | Word, Excel, PowerPoint, other files | A local path to a cached copy, plus the preview KLYPIX saved (opening text, first rows). |
-| Folder | Its file list; pass `entry_paths` (up to 8) to get those files the same way. |
+| Folder | Its file list; give `entry_paths` (up to 8) to get those files the same way. |
 | Audio, video | Only a reading KLYPIX already saved on the card (for example a transcript); otherwise a local path and a plain note that nothing says what it contains. |
 
 Readings KLYPIX saved on a card — transcripts, OCR results, *Read contents*

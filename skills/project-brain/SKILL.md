@@ -27,7 +27,7 @@ plainly. The person can create one with the KLYPIX desktop app, or by running
 Call `brain_sync` before you edit anything:
 
 - `project`: the absolute path of the project root (the folder that contains
-  `brain.klypix`). Always pass it — it keeps separate repositories on separate
+  `brain.klypix`). Always give it — it keeps separate repositories on separate
   brains.
 - `intent`: one sentence describing the task.
 - `files`: the project-relative files you expect to touch (up to 20).
@@ -113,13 +113,13 @@ with `brain_message`, addressed to the session id shown by `brain_sync` (or
 ## 5. Maintenance (only when asked or clearly useful)
 
 - `brain_reconcile` — lists contradictions, unrecorded migrations and open cards
-  a release already closed. Read-only unless you pass confirm/dismiss for
+  a release already closed. Read-only unless you give confirm/dismiss for
   entries you verified.
 - `brain_connect` — proposes links for orphaned cards; draws them only with
   `apply: true`.
 - `brain_garden` — consolidates dormant cards in overgrown areas. Applying needs
   an approval code that only the person can generate; never guess it.
-- `brain_doctor` — read-only health check. Pass `check_npm: true` only when the
+- `brain_doctor` — read-only health check. Give `check_npm: true` only when the
   person asks whether a newer version exists (it makes one npm registry
   request).
 

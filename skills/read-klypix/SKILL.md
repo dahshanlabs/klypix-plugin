@@ -40,7 +40,7 @@ per call, as `read_canvas` prints them). Cards that hold something carry an
 - **PDFs, Word, Excel, PowerPoint and other files** — a local path to a cached
   copy plus KLYPIX's saved preview. Open the path with your file-reading tool
   to read the whole document.
-- **Folders** — the file list; pass `entry_paths` (up to 8) to get those files.
+- **Folders** — the file list; give `entry_paths` (up to 8) to get those files.
 - **Audio and video** — only a reading KLYPIX saved on the card (for example a
   transcript). If there is none, tell the user the step: open the canvas in
   KLYPIX, select the card and choose *Read contents*, then ask again.
@@ -60,7 +60,7 @@ Other read tools, when they fit better:
   canvases it has open, and what a feature still needs from the person.
 
 The canvas folder is the current project folder (or the project you last
-passed to `brain_sync`), searched up to six folders deep. A file outside it can
+given to `brain_sync`), searched up to six folders deep. A file outside it can
 always be read by absolute path.
 
 ## How to interpret the output

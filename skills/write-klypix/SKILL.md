@@ -24,7 +24,7 @@ This skill uses only the plugin's MCP tools. Do not write the file yourself.
 
 Arguments:
 
-- `title` — the canvas title; also the file name unless you pass `filename`.
+- `title` — the canvas title; also the file name unless you give `filename`.
 - `cards` — each needs `text` (first line = title). Optional: `heading: true`
   for the main goal or topic, `color` as a hex value (for example `#ef4444`
   for a risk), `group` to place the card in a titled box by name.
@@ -75,20 +75,20 @@ Example (a checklist read in order — use `groups`):
 ```
 
 The tool saves the file in the canvas folder — the current project folder, or
-the project you last passed to `brain_sync` — and replies with the exact path.
+the project you last given to `brain_sync` — and replies with the exact path.
 It never overwrites an existing canvas; it picks a free name instead. Give the
 user the path from the reply.
 
 ## Add to an existing canvas — `add_to_canvas`
 
-Pass `canvas` (title, filename or absolute path), `cards`, and optional
+Give `canvas` (title, filename or absolute path), `cards`, and optional
 `connections`. Existing cards keep their positions; new cards are placed to the
 right. Connections may point at new cards (by index or title) or at existing
 cards (by their exact title — read the canvas first with `read_canvas`).
 
 `add_to_canvas` refuses, and writes nothing, when the canvas is open in KLYPIX
 (close its tab first; project brains are the exception), when the target box is
-locked from AI tools, or when it is frozen. Pass the refusal on to the user.
+locked from AI tools, or when it is frozen. Give the refusal on to the user.
 
 For the project's own `brain.klypix`, prefer the `project-brain` skill and
 `brain_note`, which handle supersession and resolution.
