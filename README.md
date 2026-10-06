@@ -75,7 +75,7 @@ the project folder, or use the KLYPIX desktop app. In a project without a
    with `brain_message` to that session and tells you whether it was delivered
    or queued.
 3. *"Record that we chose server-side sessions over JWTs because of
-   revocation, and close the open question about token expiry."* — Claude
+   revocation, and close the open question about session length."* — Claude
    writes a decision with `brain_note` and resolves the matching question.
 4. *"Turn this release plan into a board I can open in KLYPIX."* — Claude builds
    a grouped checklist with `create_canvas` and gives you the file path.
@@ -127,8 +127,8 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
   rest) or the `AGENTS.md` brief block, in this project or any other.
 - **Change Claude's settings.** It never writes `~/.claude/settings.json`,
   hooks, permissions or any other host configuration.
-- **Collect data or read credentials.** It sends no telemetry or usage data and
-  reads no API keys or tokens.
+- **Collect data or read your sign-ins.** It sends no telemetry or usage data,
+  and it never reads the sign-in details of your accounts or services.
 
 ### What it asks Claude to do
 
@@ -183,12 +183,13 @@ is on (it is on by default), a tool call that needs the app connects to it over
 a **local named pipe on this PC**. Nothing connects at startup, or while KLYPIX
 is closed or the switch is off.
 
-- **How the connection is checked:** KLYPIX writes a new random token to
-  `%LOCALAPPDATA%\klypix\agent-bridge\token` each time it starts. Before any
-  request is sent, both sides prove they hold that token; the server never
-  sends a request to a pipe that cannot prove itself. The token and the pipe
-  name are never logged, returned to Claude or shown by `brain_doctor`. Any
-  program running under your Windows account can read the token.
+- **How the connection is checked:** each time KLYPIX starts, it writes a new
+  random code to a file in your Windows profile's local app-data folder
+  (`klypix/agent-bridge`). Before any request is sent, both sides prove they
+  hold that code; the server never sends a request to a pipe that cannot prove
+  itself. The code and the pipe name are never logged, returned to Claude or
+  shown by `brain_doctor`. Any program running under your Windows account can
+  read that file.
 - **What Claude can then do:** read a canvas that is open in KLYPIX live
   (including unsaved changes, and which lens, filters, layers and cards you
   have selected); ask KLYPIX to read cards — web page text, text in photos and
