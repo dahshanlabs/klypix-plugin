@@ -1,7 +1,7 @@
 {
   "name": "klypix",
   "displayName": "KLYPIX",
-  "version": "1.93.0",
+  "version": "1.94.0",
   "description": "One project. One shared understanding. Gives Claude the KLYPIX project brain over MCP: read and grow a project's brain.klypix (decisions, open questions, corrections, wired together as a canvas you can inspect), and coordinate with other agent sessions on this machine through declared intent, expected files, overlap warnings and handoff notes.",
   "author": {
     "name": "Dahshan Labs",
@@ -27,7 +27,7 @@
   "mcpServers": {
     "klypix-canvas": {
       "command": "npx",
-      "args": ["-y", "klypix-mcp@1.93.0"],
+      "args": ["-y", "klypix-mcp@1.94.0"],
       "env": {
         "KLYPIX_PLUGIN": "1",
         "KLYPIX_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}",

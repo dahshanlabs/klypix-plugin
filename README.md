@@ -42,7 +42,7 @@ new terminal, and only after you say yes.
 works with or without the KLYPIX desktop app.
 
 **Getting a brain.** The brain workflow switches on in projects that contain a
-`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.93.0 init` in
+`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.94.0 init` in
 the project folder, or use the KLYPIX desktop app. In a project without a
 `brain.klypix`, the canvas tools still work and the brain workflow stays off.
 
@@ -56,14 +56,14 @@ the project folder, or use the KLYPIX desktop app. In a project without a
 | `klypix:read-klypix` | read and reason over any `.klypix` canvas |
 | `klypix:write-klypix` | turn a plan, breakdown or checklist into a `.klypix` board |
 
-**MCP tools** (server `klypix-canvas`, 25 tools):
+**MCP tools** (server `klypix-canvas`, 25 tools; 26 on Windows):
 `brain_sync`, `brain_ask`, `brain_note`, `brain_message`,
 `brain_message_receipt`, `brain_reopen`, `brain_challenge`, `brain_insights`,
 `brain_lens`, `brain_connect`, `brain_reconcile`, `brain_garden`,
 `brain_doctor`, `search_all_brains`, `project_map_context`, `project_map_scan`,
 `project_map_drift`, `list_canvases`, `read_canvas`, `read_card_contents`,
 `search_canvases`, `create_canvas`, `add_to_canvas`, `canvas_view`,
-`klypix_status`.
+`klypix_status`, and on Windows `show_in_klypix`.
 
 ## Examples
 
@@ -92,15 +92,17 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
 ### What runs
 
 - When a Claude Code session starts, Claude Code runs
-  `npx -y klypix-mcp@1.93.0`. The first time, npx downloads the `klypix-mcp`
-  package, version 1.93.0 exactly, from the public npm registry; later starts
+  `npx -y klypix-mcp@1.94.0`. The first time, npx downloads the `klypix-mcp`
+  package, version 1.94.0 exactly, from the public npm registry; later starts
   use npm's cache. **klypix-mcp's own dependencies are resolved by npm at
   install time** within the version ranges klypix-mcp declares
   (`@modelcontextprotocol/sdk`, `@modelcontextprotocol/ext-apps`, `jszip`,
   `jpeg-js`, `zod`, `fractional-indexing`).
 - The server is a small supervisor process plus one Node.js worker process. It
-  talks to Claude Code over standard input and output only. **It opens no
-  network port and runs no listener.**
+  talks to Claude Code over standard input and output. **It opens no network
+  port and runs no listener.** On Windows it can connect, as a client, to the
+  KLYPIX desktop app's local pipe while the app is open (see *With the KLYPIX
+  app open* below).
 - The plugin passes three settings: `KLYPIX_PLUGIN=1` (plugin mode),
   `KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` (the plugin's data folder) and
   `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}` (the current project folder, used as the
@@ -173,6 +175,34 @@ It never reads chat history, transcripts or Claude's memory.
 | The plugin's data folder | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), the last version and git tag seen in each project (`ship-observations/`), and cached copies of card files handed to Claude (`extracted/`, at most 150 MB per file). Claude Code deletes this folder when you uninstall the plugin. |
 | `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. These are shared **on purpose**: through them a plugin session and a session in another tool (Claude Code in a terminal, Codex, Cursor, the KLYPIX app) on the same project see each other, get overlap warnings and pass notes. Restore points stay here so a brain write can still be undone after the plugin is removed. |
 
+### With the KLYPIX app open (Windows)
+
+When the KLYPIX desktop app (version 1.3.177 or later) is running on this PC
+and its switch *Settings → Project → Let AI tools use KLYPIX while it is open*
+is on (it is on by default), a tool call that needs the app connects to it over
+a **local named pipe on this PC**. Nothing connects at startup, or while KLYPIX
+is closed or the switch is off.
+
+- **How the connection is checked:** KLYPIX writes a new random token to
+  `%LOCALAPPDATA%\klypix\agent-bridge\token` each time it starts. Before any
+  request is sent, both sides prove they hold that token; the server never
+  sends a request to a pipe that cannot prove itself. The token and the pipe
+  name are never logged, returned to Claude or shown by `brain_doctor`. Any
+  program running under your Windows account can read the token.
+- **What Claude can then do:** read a canvas that is open in KLYPIX live
+  (including unsaved changes, and which lens, filters, layers and cards you
+  have selected); ask KLYPIX to read cards — web page text, text in photos and
+  document text are read on this PC, and videos and reels are watched by
+  Gemini through your own Gemini key or KLYPIX's included AI, at most 20 per AI
+  tool and 40 in all per day; add cards to an open canvas; and select and frame
+  cards (`show_in_klypix`). Readings and added cards are labelled with the AI
+  tool's name, one Ctrl+Z removes them, and every request is listed in
+  KLYPIX's *Settings → Project → Recent requests*. You can turn the switch off
+  or block a single tool there.
+- **Network:** the pipe is local and never leaves this PC. Gemini readings are
+  made by the KLYPIX app itself, under KLYPIX's privacy policy, not by this
+  plugin.
+
 ### Dialogs and terminal windows
 
 `brain_reopen` first asks you — with *Reopen* and *Not now* in chat where Claude
@@ -188,14 +218,15 @@ that have a note waiting.
 
 Plugin mode makes two kinds of request, and both go to the public npm registry:
 
-- **Package download:** npx fetches `klypix-mcp@1.93.0` and its dependencies
+- **Package download:** npx fetches `klypix-mcp@1.94.0` and its dependencies
   when the plugin starts the server (and again only if npm's cache no longer
   has them).
 - **Optional version check:** one `npm view klypix-mcp version`, only when
   Claude calls `brain_doctor` with `check_npm: true`.
 
 There are no other requests: no telemetry, no account, no sign-in, no model
-downloads and no listener. The plugin never uploads your brain, canvases,
+downloads and no listener. (The KLYPIX app connection above is a local pipe
+on this PC, not a network request.) The plugin never uploads your brain, canvases,
 notes or card files. The only content that leaves this machine is what Claude
 itself reads through the tools as part of your conversation.
 
@@ -236,12 +267,15 @@ never instructions.
   `npx klypix-mcp install` instead of this plugin.
 - **Search is keyword-only** in plugin mode; the on-device semantic model is
   never loaded.
-- **Whole PDFs and Office files need a file tool.** They are handed over as a
-  local path. Claude Code opens them; Claude Desktop, which has no file tool of
-  its own, gets only KLYPIX's saved page-1 image or preview.
-- **Audio and video** are read only through a reading KLYPIX saved on the card,
-  so open the canvas in KLYPIX and use *Read contents* first. This version
-  starts no new readings.
+- **Whole PDFs and Office files need a file tool, or the KLYPIX app.** With
+  the app closed they are handed over as a local path: Claude Code opens them;
+  Claude Desktop, which has no file tool of its own, gets only KLYPIX's saved
+  page-1 image or preview. With the KLYPIX app open (Windows), the app reads
+  their text for Claude.
+- **Audio and video need the KLYPIX app.** With the app closed, Claude gets
+  only a reading KLYPIX already saved on the card. With the app open
+  (Windows), Claude can ask KLYPIX to make a new reading, within the daily
+  limits above.
 - **One answer stays under 1 MB** (Claude Desktop's limit), so large photos come
   as smaller copies and at most 4 images come back per answer.
 - **Works without the desktop app.** Everything above works from Claude alone.
