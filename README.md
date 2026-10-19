@@ -42,7 +42,7 @@ new terminal, and only after you say yes.
 works with or without the KLYPIX desktop app.
 
 **Getting a brain.** The brain workflow switches on in projects that contain a
-`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.94.0 init` in
+`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.103.0 init` in
 the project folder, or use the KLYPIX desktop app. In a project without a
 `brain.klypix`, the canvas tools still work and the brain workflow stays off.
 
@@ -56,9 +56,9 @@ the project folder, or use the KLYPIX desktop app. In a project without a
 | `klypix:read-klypix` | read and reason over any `.klypix` canvas |
 | `klypix:write-klypix` | turn a plan, breakdown or checklist into a `.klypix` board |
 
-**MCP tools** (server `klypix-canvas`, 25 tools; 26 on Windows):
+**MCP tools** (server `klypix-canvas`, 26 tools; 27 on Windows):
 `brain_sync`, `brain_ask`, `brain_note`, `brain_message`,
-`brain_message_receipt`, `brain_reopen`, `brain_challenge`, `brain_insights`,
+`brain_message_receipt`, `brain_handoff`, `brain_reopen`, `brain_challenge`, `brain_insights`,
 `brain_lens`, `brain_connect`, `brain_reconcile`, `brain_garden`,
 `brain_doctor`, `search_all_brains`, `project_map_context`, `project_map_scan`,
 `project_map_drift`, `list_canvases`, `read_canvas`, `read_card_contents`,
@@ -92,8 +92,8 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
 ### What runs
 
 - When a Claude Code session starts, Claude Code runs
-  `npx -y klypix-mcp@1.94.0`. The first time, npx downloads the `klypix-mcp`
-  package, version 1.94.0 exactly, from the public npm registry; later starts
+  `npx -y klypix-mcp@1.103.0`. The first time, npx downloads the `klypix-mcp`
+  package, version 1.103.0 exactly, from the public npm registry; later starts
   use npm's cache. **klypix-mcp's own dependencies are resolved by npm at
   install time** within the version ranges klypix-mcp declares
   (`@modelcontextprotocol/sdk`, `@modelcontextprotocol/ext-apps`, `jszip`,
@@ -218,7 +218,7 @@ that have a note waiting.
 
 Plugin mode makes two kinds of request, and both go to the public npm registry:
 
-- **Package download:** npx fetches `klypix-mcp@1.94.0` and its dependencies
+- **Package download:** npx fetches `klypix-mcp@1.103.0` and its dependencies
   when the plugin starts the server (and again only if npm's cache no longer
   has them).
 - **Optional version check:** one `npm view klypix-mcp version`, only when
