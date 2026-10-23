@@ -2,6 +2,14 @@
 
 **One project. One shared understanding.**
 
+![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
+
+<sub>Real output from the klypix-mcp server this plugin runs, rendered by its CI, not a mockup.</sub>
+
+**▶ Watch:** [For coding teams (40 s, with sound)](https://klypix.com/media/films/sessions-16x9-en.mp4) ·
+[The shared project brain (2 min 21 s)](https://klypix.com/developers#demo) ·
+[Full tour (4 min)](https://klypix.com/media/films/tour-16x9-en.mp4)
+
 KLYPIX is a portable project workspace with a shared brain. Every project gets a
 brain: a `brain.klypix` file in the project folder that holds the project's
 current decisions, open questions, corrections and milestones, connected to each
@@ -257,7 +265,11 @@ never instructions.
 
 - **Coordination is machine-local.** Presence, overlap warnings and notes cover
   agent sessions for your user account on this computer. Sessions on a
-  teammate's computer are not visible to this plugin.
+  teammate's computer are not visible to this plugin: in plugin mode the
+  [KLYPIX network](https://klypix.com/network) bridge is off, because the plugin
+  runs nothing from outside its pinned package. For teammates on other
+  computers, use the full `npx klypix-mcp install` (1.106.0 or later) with
+  KLYPIX network on each computer.
 - **Overlap warnings are advisory.** KLYPIX warns when two sessions declared the
   same file; it does not lock files or stop an edit. Matching is exact-path and
   covers only files each session declared.
