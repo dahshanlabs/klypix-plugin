@@ -2,12 +2,12 @@
 
 **One project. One shared understanding.**
 
-![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
+![Two sessions, Claude Code and Codex, on one PC and one brain.klypix. Both plan to change src/checkout/Checkout.tsx, and each gets a heads-up from KLYPIX. Nothing is blocked. The film ends on the KLYPIX mark and "Every project gets a brain."](https://raw.githubusercontent.com/dahshanlabs/klypix-plugin/main/assets/klypix-sessions.gif)
 
-<sub>Real output from the klypix-mcp server this plugin runs, rendered by its CI, not a mockup.</sub>
+<sub>Two agent sessions on one computer, one project brain: each gets a heads-up when they plan to change the same file. A 14-second cut of the sessions film on klypix.com. [Real output from the server this plugin runs](https://github.com/dahshanlabs/klypix-mcp/blob/master/docs/demo/demo.gif), rendered by its CI.</sub>
 
 **▶ Watch:** [For coding teams (40 s, with sound)](https://klypix.com/media/films/sessions-16x9-en.mp4) ·
-[The shared project brain (2 min 21 s)](https://klypix.com/developers#demo) ·
+[Correct it once (20 s)](https://klypix.com/media/films/correct-16x9-en.mp4) ·
 [Full tour (4 min)](https://klypix.com/media/films/tour-16x9-en.mp4)
 
 KLYPIX is a portable project workspace with a shared brain. Every project gets a
@@ -26,6 +26,7 @@ it, Claude can:
 - **Coordinate with other agent sessions on this machine.** Each session
   declares what it is doing and which files it expects to touch; KLYPIX shows
   who else is active on the project and warns when declared files overlap.
+  The warning is advisory: nothing blocks an edit.
 - **Hand work to another session** with a one-time note instead of asking you
   to copy and paste between agents.
 - **Read and build `.klypix` canvases** — turn a plan into a board, or read a
@@ -50,7 +51,7 @@ new terminal, and only after you say yes.
 works with or without the KLYPIX desktop app.
 
 **Getting a brain.** The brain workflow switches on in projects that contain a
-`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.105.0 init` in
+`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.106.0 init` in
 the project folder, or use the KLYPIX desktop app. In a project without a
 `brain.klypix`, the canvas tools still work and the brain workflow stays off.
 
@@ -100,8 +101,8 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
 ### What runs
 
 - When a Claude Code session starts, Claude Code runs
-  `npx -y klypix-mcp@1.105.0`. The first time, npx downloads the `klypix-mcp`
-  package, version 1.105.0 exactly, from the public npm registry; later starts
+  `npx -y klypix-mcp@1.106.0`. The first time, npx downloads the `klypix-mcp`
+  package, version 1.106.0 exactly, from the public npm registry; later starts
   use npm's cache. **klypix-mcp's own dependencies are resolved by npm at
   install time** within the version ranges klypix-mcp declares
   (`@modelcontextprotocol/sdk`, `@modelcontextprotocol/ext-apps`, `jszip`,
@@ -226,7 +227,7 @@ that have a note waiting.
 
 Plugin mode makes two kinds of request, and both go to the public npm registry:
 
-- **Package download:** npx fetches `klypix-mcp@1.105.0` and its dependencies
+- **Package download:** npx fetches `klypix-mcp@1.106.0` and its dependencies
   when the plugin starts the server (and again only if npm's cache no longer
   has them).
 - **Optional version check:** one `npm view klypix-mcp version`, only when
