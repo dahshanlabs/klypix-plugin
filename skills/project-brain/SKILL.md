@@ -20,7 +20,7 @@ always go through the tools, which keep a restore point and take a write lock.
 
 If the project has no `brain.klypix`, this workflow does not apply: say so
 plainly. The person can create one with the KLYPIX desktop app, or by running
-`npx klypix-mcp@1.106.0 init` themselves in the project folder.
+`npx klypix-mcp@1.107.1 init` themselves in the project folder.
 
 ## 1. Start of a task — `brain_sync`
 
