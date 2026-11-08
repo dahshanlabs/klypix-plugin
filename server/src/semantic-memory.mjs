@@ -1,0 +1,980 @@
+// Bounded semantic runtime for long-lived KLYPIX MCP/A2A workers.
+//
+// The deterministic brain core (parsing, lifecycle/correction overlays,
+// time-travel, locks, and mutations) does not live here. This module owns only
+// optional local neural retrieval so memory failures can always degrade to the
+// lexical core without changing project truth.
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
+import { enrichmentTextFor, readEnrichment } from './enrichment.mjs';
+import { createRequire } from 'module';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+import * as autoUpdateLib from './mcp-auto-update.mjs';
+
+// Plugin mode (KLYPIX_PLUGIN=1) never loads the on-device semantic runtime:
+// not the package's own optional copy, and not ~/.claude/project-brain/semantic
+// (code from outside the pinned package), so no model is ever downloaded.
+// Retrieval is keyword-only there. Evaluated per call, not at import.
+const semanticDisabledByPlugin = () => (typeof autoUpdateLib.isPluginMode === 'function'
+  ? autoUpdateLib.isPluginMode()
+  : String(process.env.KLYPIX_PLUGIN ?? '').trim() === '1');
+const PLUGIN_SEMANTIC_ERROR = 'semantic retrieval is off in plugin mode (keyword retrieval only)';
+
+const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
+const EMB_DIR = path.join(PB_DIR, 'embeddings');
+const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+const MIN_SAFE_SHARP_VERSION = [0, 35, 3];
+export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5';
+export const EMBEDDING_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
+export const EMBEDDING_POOLING = 'cls';
+export const EMBEDDING_CACHE_KEY = `${EMBEDDING_MODEL_ID}|q8|${EMBEDDING_POOLING}|query-instruction-v1`;
+
+const rawMode = String(
+  process.env.KLYPIX_SEMANTIC_MEMORY_MODE
+  || process.env.KLYPIX_MEMORY_MODE
+  || 'bounded',
+).trim().toLowerCase();
+const MODE = rawMode === 'legacy' ? 'legacy' : 'bounded';
+const BOUNDED = MODE === 'bounded';
+
+const intEnv = (name, fallback, min, max) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.trunc(n))) : fallback;
+};
+// One card per inference call. A batch pads every card to its longest member
+// (cards run up to 1,500 characters), so batching wastes work on a brain's
+// mixed lengths. Measured 2026-10-11, real bge-small q8, 400 real cards on a
+// laptop CPU: batch 16 = 96 ms a card, 1,176 MB peak; 8 = 79 ms, 720 MB;
+// 4 = 63–70 ms, ~505 MB; 1 = 41–49 ms, ~305 MB. The fastest is also the lightest.
+export const EMBED_BATCH_DEFAULT = 1;
+const EMBED_BATCH_SIZE = intEnv('KLYPIX_EMBED_BATCH_SIZE', EMBED_BATCH_DEFAULT, 1, 64);
+const RERANK_BATCH_SIZE = intEnv('KLYPIX_RERANK_BATCH_SIZE', 4, 1, 32);
+const MAX_INFERENCE_QUEUE = intEnv('KLYPIX_SEMANTIC_MAX_QUEUE', 16, 1, 256);
+const idleRaw = process.env.KLYPIX_SEMANTIC_IDLE_MS;
+const SEMANTIC_IDLE_MS = idleRaw === '0'
+  ? 0
+  : intEnv('KLYPIX_SEMANTIC_IDLE_MS', 10 * 60_000, 1_000, 60 * 60_000);
+const CACHE_LOCK_TIMEOUT_MS = intEnv('KLYPIX_SEMANTIC_CACHE_LOCK_MS', 10 * 60_000, 1_000, 30 * 60_000);
+const CACHE_LOCK_STALE_MS = Math.max(CACHE_LOCK_TIMEOUT_MS + 60_000, 15 * 60_000);
+
+const counters = {
+  inferenceCalls: 0,
+  embedBatches: 0,
+  rerankBatches: 0,
+  tensorsDisposed: 0,
+  queueRejected: 0,
+  maxQueued: 0,
+  cacheFilesMerged: 0,
+  cacheWrites: 0,
+  cacheWriteFailures: 0,
+  cacheLockWaits: 0,
+  cacheLockTimeouts: 0,
+  modelDisposals: 0,
+  idleDisposals: 0,
+  lastDisposeReason: null,
+  highWaterRss: 0,
+  highWaterExternal: 0,
+  highWaterArrayBuffers: 0,
+};
+let inferenceTail = Promise.resolve();
+let inferenceQueued = 0;
+let inferenceActive = 0;
+let embedderPromise = null;
+let rerankerPromise = null;
+const vectorBuildTails = new Map();
+let semanticIdleTimer = null;
+let semanticLeases = 0;
+let lastSemanticActivityAt = Date.now();
+
+const sampleMemory = () => {
+  const m = process.memoryUsage();
+  counters.highWaterRss = Math.max(counters.highWaterRss, m.rss);
+  counters.highWaterExternal = Math.max(counters.highWaterExternal, m.external);
+  counters.highWaterArrayBuffers = Math.max(counters.highWaterArrayBuffers, m.arrayBuffers || 0);
+  return m;
+};
+
+export function semanticMemorySnapshot() {
+  const memory = sampleMemory();
+  return {
+    mode: MODE,
+    config: {
+      embedBatchSize: BOUNDED ? EMBED_BATCH_SIZE : null,
+      rerankBatchSize: BOUNDED ? RERANK_BATCH_SIZE : null,
+      maxInferenceQueue: BOUNDED ? MAX_INFERENCE_QUEUE : null,
+      prewarm: shouldPrewarmSemantic(),
+      idleDisposeMs: BOUNDED ? SEMANTIC_IDLE_MS : null,
+      embeddingModel: EMBEDDING_MODEL_ID,
+      embeddingPooling: EMBEDDING_POOLING,
+      rerankDefault: false,
+    },
+    queue: { active: inferenceActive, queued: inferenceQueued, leases: semanticLeases },
+    counters: { ...counters },
+    memory: {
+      rss: memory.rss,
+      heapTotal: memory.heapTotal,
+      heapUsed: memory.heapUsed,
+      external: memory.external,
+      arrayBuffers: memory.arrayBuffers || 0,
+    },
+  };
+}
+
+export const semanticMemoryMode = () => MODE;
+export const shouldPrewarmSemantic = () => !semanticDisabledByPlugin() && (MODE === 'legacy' || process.env.KLYPIX_SEMANTIC_PREWARM === '1');
+
+const clearSemanticIdleTimer = () => {
+  if (!semanticIdleTimer) return;
+  clearTimeout(semanticIdleTimer);
+  semanticIdleTimer = null;
+};
+
+const modelsLoaded = () => Boolean(embedderPromise || rerankerPromise);
+
+async function disposeModelsUnlocked(reason = 'explicit') {
+  clearSemanticIdleTimer();
+  const embedder = await embedderPromise?.catch?.(() => null);
+  const reranker = await rerankerPromise?.catch?.(() => null);
+  if (BOUNDED) {
+    try { await embedder?.dispose?.(); } catch { /* process recycle remains the final fallback */ }
+    try { await reranker?.model?.dispose?.(); } catch { /* */ }
+  }
+  embedderPromise = null;
+  rerankerPromise = null;
+  counters.modelDisposals++;
+  if (reason === 'idle') counters.idleDisposals++;
+  counters.lastDisposeReason = reason;
+  sampleMemory();
+}
+
+function enqueueMaintenance(fn) {
+  const run = inferenceTail.catch(() => {}).then(async () => {
+    inferenceActive++;
+    try { return await fn(); }
+    finally { inferenceActive--; }
+  });
+  inferenceTail = run.catch(() => {});
+  return run;
+}
+
+function armSemanticIdleDisposal() {
+  clearSemanticIdleTimer();
+  if (!BOUNDED || SEMANTIC_IDLE_MS <= 0 || !modelsLoaded()) return;
+  if (semanticLeases || inferenceActive || inferenceQueued) return;
+  const remaining = Math.max(0, SEMANTIC_IDLE_MS - (Date.now() - lastSemanticActivityAt));
+  semanticIdleTimer = setTimeout(() => {
+    semanticIdleTimer = null;
+    if (semanticLeases || inferenceActive || inferenceQueued || !modelsLoaded()) {
+      armSemanticIdleDisposal();
+      return;
+    }
+    enqueueMaintenance(async () => {
+      if (semanticLeases || Date.now() - lastSemanticActivityAt < SEMANTIC_IDLE_MS || !modelsLoaded()) {
+        armSemanticIdleDisposal();
+        return;
+      }
+      await disposeModelsUnlocked('idle');
+    }).catch(() => {});
+  }, remaining);
+  semanticIdleTimer.unref?.();
+}
+
+function acquireSemanticLease() {
+  semanticLeases++;
+  clearSemanticIdleTimer();
+  let released = false;
+  function release() {
+    if (released) return;
+    released = true;
+    semanticLeases = Math.max(0, semanticLeases - 1);
+    lastSemanticActivityAt = Date.now();
+    armSemanticIdleDisposal();
+  }
+  return release;
+}
+
+async function withInferenceSlot(label, fn) {
+  if (!BOUNDED) return fn();
+  if (inferenceQueued >= MAX_INFERENCE_QUEUE) {
+    counters.queueRejected++;
+    const error = new Error(`semantic inference queue saturated before ${label}`);
+    error.code = 'KLYPIX_SEMANTIC_QUEUE_FULL';
+    throw error;
+  }
+  inferenceQueued++;
+  counters.maxQueued = Math.max(counters.maxQueued, inferenceQueued);
+  const run = inferenceTail.catch(() => {}).then(async () => {
+    inferenceQueued--;
+    inferenceActive++;
+    clearSemanticIdleTimer();
+    lastSemanticActivityAt = Date.now();
+    counters.inferenceCalls++;
+    sampleMemory();
+    try { return await fn(); }
+    finally {
+      inferenceActive--;
+      lastSemanticActivityAt = Date.now();
+      sampleMemory();
+      armSemanticIdleDisposal();
+    }
+  });
+  // A failed inference must not poison the queue for later lexical/semantic work.
+  inferenceTail = run.catch(() => {});
+  return run;
+}
+
+function withTimeout(promise, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(null), timeoutMs);
+    timer.unref?.();
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+function disposeTensorTree(value, seen = new Set()) {
+  if (!BOUNDED || value == null || (typeof value !== 'object' && typeof value !== 'function')) return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  // Transformers.js Tensor exposes dims/data plus dispose(). Do not call a
+  // generic object's dispose method here: model/pipeline lifetimes are managed
+  // separately and must survive across queries.
+  const tensorLike = typeof value.dispose === 'function'
+    && (Array.isArray(value.dims) || Object.prototype.hasOwnProperty.call(value, 'ort_tensor'));
+  if (tensorLike) {
+    try { value.dispose(); counters.tensorsDisposed++; } catch { /* best-effort; lexical fallback stays available */ }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) disposeTensorTree(item, seen);
+    return;
+  }
+  for (const item of Object.values(value)) disposeTensorTree(item, seen);
+}
+
+function findPackageManifest(entryPath, expectedName) {
+  let dir = path.dirname(entryPath);
+  while (dir !== path.dirname(dir)) {
+    try {
+      const manifestPath = path.join(dir, 'package.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest?.name === expectedName) return { manifestPath, manifest };
+    } catch { /* keep walking */ }
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+function isSafeSharpVersion(version) {
+  const parts = String(version || '').split('.').slice(0, 3).map(Number);
+  if (parts.length !== 3 || parts.some(part => !Number.isInteger(part) || part < 0)) return false;
+  for (let i = 0; i < MIN_SAFE_SHARP_VERSION.length; i++) {
+    if (parts[i] !== MIN_SAFE_SHARP_VERSION[i]) return parts[i] > MIN_SAFE_SHARP_VERSION[i];
+  }
+  return true;
+}
+
+export function semanticRuntimeEntryIfSafe(transformersEntry) {
+  try {
+    const transformers = findPackageManifest(transformersEntry, '@huggingface/transformers');
+    if (!transformers) return null;
+    // Resolve from the exact executable bundle entry. Resolving from the
+    // package manifest misses a Sharp installation shadowed under dist/
+    // even though that is the copy the ESM bundle itself will import.
+    const sharpEntry = createRequire(transformersEntry).resolve('sharp');
+    const sharp = findPackageManifest(sharpEntry, 'sharp');
+    return sharp && isSafeSharpVersion(sharp.manifest.version) ? transformersEntry : null;
+  } catch { return null; }
+}
+
+function ambientTransformersEntryIfSafe() {
+  try {
+    const entry = createRequire(import.meta.url).resolve('@huggingface/transformers');
+    return semanticRuntimeEntryIfSafe(entry);
+  } catch { return null; }
+}
+
+async function loadTransformers() {
+  if (semanticDisabledByPlugin()) throw new Error(PLUGIN_SEMANTIC_ERROR);
+  if (ambientTransformersEntryIfSafe()) {
+    try { return await import('@huggingface/transformers'); } catch { /* try owned runtime */ }
+  }
+  {
+    const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
+    let lastErr;
+    for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
+      const entry = path.join(base, f);
+      if (!semanticRuntimeEntryIfSafe(entry)) continue;
+      try { return await import(new URL('file:///' + entry.replace(/\\/g, '/')).href); }
+      catch (error) { lastErr = error; }
+    }
+    throw lastErr || new Error('semantic runtime rejected: sharp must be >=0.35.3');
+  }
+}
+
+// Is the on-device runtime INSTALLED at all?
+//
+// A caller that gets no embedder cannot otherwise tell "warming up / queue
+// saturated" (retry works) from "never installed" (retrying forever will not
+// help). Those need opposite advice, and conflating them is why a lexical-only
+// install can look like a slow one indefinitely — measured 2026-08-10, the
+// lexical-only ranker scores recall@5 = 0% on the frozen human question set
+// against ~30% with the runtime present, so this is not a cosmetic difference.
+//
+// Cheap on purpose: resolves the specifier and stats the fallback path. It
+// never imports the library and never loads a model, so it is safe to call on
+// every query. Mirrors loadTransformers()'s own resolution order — keep the two
+// in step.
+let runtimeInstalledCache = null;
+export function semanticRuntimeInstalled() {
+  if (semanticDisabledByPlugin()) return false;
+  if (runtimeInstalledCache !== null) return runtimeInstalledCache;
+  let found = false;
+  try {
+    const entry = createRequire(import.meta.url).resolve('@huggingface/transformers');
+    found = Boolean(semanticRuntimeEntryIfSafe(entry));
+  } catch {
+    // Fall through to the owned runtime below.
+  }
+  if (!found) {
+    const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
+    found = ['transformers.node.mjs', 'transformers.mjs']
+      .some(f => Boolean(semanticRuntimeEntryIfSafe(path.join(base, f))));
+  }
+  runtimeInstalledCache = found;
+  return found;
+}
+
+// One honest sentence for a caller that fell back to lexical-only ranking.
+// Returns null when semantic ranking actually ran, so callers can append it
+// unconditionally.
+export function semanticFallbackNotice(hadSemantic) {
+  if (hadSemantic) return null;
+  if (semanticDisabledByPlugin()) return `lexical only — ${PLUGIN_SEMANTIC_ERROR}: the Claude plugin runs only its pinned package and downloads no models`;
+  if (semanticRuntimeInstalled()) {
+    return 'lexical only — the on-device semantic model is still warming or the queue is saturated; retry shortly for semantic ranking';
+  }
+  // Since 1.97.0 there IS an install command (bin/klypix-install.mjs --semantic,
+  // which a person at a terminal gets by default), so the notice names it: an
+  // agent reading this can offer it to the person instead of guessing.
+  return 'LEXICAL ONLY — search by meaning is not installed, so these are keyword matches. '
+    + 'Measured on a real 3,829-card brain: the right card in the top 5 for 19 of 102 questions with keywords, 54 with search by meaning. Retrying will not help. '
+    + 'Turn it on with: npx klypix-mcp install --semantic (about 150 MB to download, once).';
+}
+
+export function getEmbedder(log = () => {}) {
+  if (semanticDisabledByPlugin()) return Promise.resolve(null);
+  if (!embedderPromise) {
+    embedderPromise = (async () => {
+      const t = await loadTransformers();
+      t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
+      const pipe = await t.pipeline('feature-extraction', EMBEDDING_MODEL_ID, { dtype: 'q8' });
+      lastSemanticActivityAt = Date.now();
+      queueMicrotask(armSemanticIdleDisposal);
+      return pipe;
+    })().catch((error) => {
+      log('semantic unavailable (lexical fallback):', error?.message || error);
+      return null;
+    });
+  }
+  return embedderPromise;
+}
+
+export function getReranker(log = () => {}) {
+  if (semanticDisabledByPlugin()) return Promise.resolve(null);
+  if (!rerankerPromise) {
+    rerankerPromise = (async () => {
+      const t = await loadTransformers();
+      t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
+      const tokenizer = await t.AutoTokenizer.from_pretrained('Xenova/ms-marco-MiniLM-L-6-v2');
+      const model = await t.AutoModelForSequenceClassification.from_pretrained(
+        'Xenova/ms-marco-MiniLM-L-6-v2',
+        { dtype: 'q8' },
+      );
+      lastSemanticActivityAt = Date.now();
+      queueMicrotask(armSemanticIdleDisposal);
+      return { tokenizer, model };
+    })().catch((error) => {
+      log('reranker unavailable (no rerank):', error?.message || error);
+      return null;
+    });
+  }
+  return rerankerPromise;
+}
+
+export const getEmbedderForUse = async (log = () => {}, timeoutMs = 20_000) => {
+  const loaded = BOUNDED
+    ? await withInferenceSlot('embedder-load', () => withTimeout(getEmbedder(log), timeoutMs))
+    : await withTimeout(getEmbedder(log), timeoutMs);
+  if (!loaded || !BOUNDED) return loaded;
+  // Do not hand callers a long-lived reference to a pipeline that idle disposal
+  // may retire. The facade resolves the current generation at invocation time,
+  // so a post-idle query transparently reloads the exact same model.
+  return async (...args) => {
+    const release = acquireSemanticLease();
+    try {
+      const current = await getEmbedder(log);
+      if (!current) throw new Error('semantic embedder is unavailable');
+      return await current(...args);
+    } finally {
+      release();
+    }
+  };
+};
+
+export const withRerankerForUse = async (log = () => {}, timeoutMs = 8_000, fn = async value => value) => {
+  const loaded = BOUNDED
+    ? await withInferenceSlot('reranker-load', () => withTimeout(getReranker(log), timeoutMs))
+    : await withTimeout(getReranker(log), timeoutMs);
+  if (!loaded) return null;
+  if (!BOUNDED) return fn(loaded);
+  const release = acquireSemanticLease();
+  try {
+    // Resolve the current generation only after acquiring the lease. Idle
+    // disposal can never retire this model until the complete callback ends.
+    const current = await getReranker(log);
+    return current ? await fn(current) : null;
+  } finally {
+    release();
+  }
+};
+
+async function embedBatch(pipe, texts, kind = 'passage') {
+  let output = null;
+  try {
+    const inputs = kind === 'query' ? texts.map(text => `${EMBEDDING_QUERY_PREFIX}${text}`) : texts;
+    output = await pipe(inputs, { pooling: EMBEDDING_POOLING, normalize: true });
+    const [n, d] = output?.dims || [];
+    if (!Number.isInteger(n) || !Number.isInteger(d) || n !== texts.length || d <= 0 || !output?.data) {
+      throw new Error('semantic embedder returned an invalid tensor shape');
+    }
+    const vectors = [];
+    for (let i = 0; i < n; i++) vectors.push(Array.from(output.data.slice(i * d, (i + 1) * d)));
+    return vectors;
+  } finally {
+    disposeTensorTree(output);
+  }
+}
+
+export async function embedTexts(pipe, texts, { kind = 'passage' } = {}) {
+  const list = Array.isArray(texts) ? texts : [texts];
+  if (!list.length) return [];
+  const batchSize = BOUNDED ? EMBED_BATCH_SIZE : list.length;
+  const vectors = [];
+  for (let offset = 0; offset < list.length; offset += batchSize) {
+    const batch = list.slice(offset, offset + batchSize);
+    counters.embedBatches++;
+    const part = BOUNDED
+      ? await withInferenceSlot('embedding', () => embedBatch(pipe, batch, kind))
+      : await embedBatch(pipe, batch, kind);
+    vectors.push(...part);
+  }
+  return vectors;
+}
+
+export const dot = (a, b) => {
+  let score = 0;
+  const n = Math.min(a?.length || 0, b?.length || 0);
+  for (let i = 0; i < n; i++) score += a[i] * b[i];
+  return score;
+};
+
+export function canonicalBrainKey(brainPath) {
+  let key = path.resolve(String(brainPath)).replace(/\\/g, '/');
+  // Windows drive letters are case-insensitive; the old exact-string key made
+  // E:/... and e:/... duplicate full vector caches. Preserve all other casing
+  // because macOS/Linux projects can live on case-sensitive filesystems.
+  if (/^[A-Z]:/.test(key)) key = key[0].toLowerCase() + key.slice(1);
+  return key;
+}
+
+function cacheCandidates(brainPath) {
+  const raw = String(brainPath).replace(/\\/g, '/');
+  const canonical = canonicalBrainKey(brainPath);
+  const variants = [
+    canonical,
+    raw,
+    raw.replace(/^([a-zA-Z]):/, (_m, d) => d.toLowerCase() + ':'),
+    raw.replace(/^([a-zA-Z]):/, (_m, d) => d.toUpperCase() + ':'),
+  ];
+  return [...new Set(variants)].map((key) => ({ key, file: path.join(EMB_DIR, sha1(key) + '.json') }));
+}
+
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function withCrossProcessCacheLock(brainPath, fn, timeoutMs = CACHE_LOCK_TIMEOUT_MS) {
+  const file = cacheCandidates(brainPath)[0].file;
+  const lockFile = `${file}.lock`;
+  fs.mkdirSync(EMB_DIR, { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  let handle = null;
+  let waited = false;
+  while (!handle) {
+    try {
+      handle = fs.openSync(lockFile, 'wx');
+      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: Date.now(), modelKey: EMBEDDING_CACHE_KEY }));
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (!waited) { counters.cacheLockWaits++; waited = true; }
+      try {
+        const age = Date.now() - fs.statSync(lockFile).mtimeMs;
+        if (age > CACHE_LOCK_STALE_MS) { fs.unlinkSync(lockFile); continue; }
+      } catch { continue; }
+      if (Date.now() >= deadline) {
+        counters.cacheLockTimeouts++;
+        const timeout = new Error(`semantic cache lock timed out for ${path.basename(brainPath)}`);
+        timeout.code = 'KLYPIX_SEMANTIC_CACHE_BUSY';
+        throw timeout;
+      }
+      await wait(75);
+    }
+  }
+  // A long holder (the background preparation) refreshes the lock so it is
+  // never mistaken for an abandoned one at CACHE_LOCK_STALE_MS.
+  const touch = () => { try { const now = new Date(); fs.utimesSync(lockFile, now, now); } catch { /* best-effort */ } };
+  try { return await fn(touch); }
+  finally {
+    try { fs.closeSync(handle); } catch { /* */ }
+    try { fs.unlinkSync(lockFile); } catch { /* stale cleanup handles leftovers */ }
+  }
+}
+
+// Windows refuses a rename over a destination another process holds open
+// (EPERM, EBUSY or EACCES by configuration), and this file is read by every
+// one-shot hook and every server on the machine. A bounded backoff (five
+// attempts, 300 ms nominal in total; wall time can be longer because of timer
+// granularity) outlasts a reader passing through; any other error, and a
+// holder that stays, still throws. The retry applies in bounded mode only,
+// because only there the lock serialises writers: in legacy mode a delayed
+// rename would let an older snapshot commit after a newer one, so legacy mode
+// makes a single attempt and throws.
+const CACHE_RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const CACHE_RENAME_BACKOFF_MS = [20, 40, 80, 160];
+
+async function writeCacheAtomic(file, cache) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(cache));
+    for (let attempt = 0; ; attempt++) {
+      try { fs.renameSync(tmp, file); break; }
+      catch (error) {
+        if (!BOUNDED || attempt >= CACHE_RENAME_BACKOFF_MS.length || !CACHE_RENAME_RETRYABLE_CODES.has(error?.code)) throw error;
+        await wait(CACHE_RENAME_BACKOFF_MS[attempt]);
+      }
+    }
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* cache is best-effort */ }
+  }
+}
+
+// The disk cache is best-effort: a failed write never fails the caller, whose
+// in-memory result is already correct. It is counted, because a write that
+// keeps failing means readers keep seeing the previous file.
+async function persistCache(file, cache) {
+  try {
+    fs.mkdirSync(EMB_DIR, { recursive: true });
+    await writeCacheAtomic(file, cache);
+    counters.cacheWrites++;
+  } catch { counters.cacheWriteFailures++; }
+}
+
+// A cache entry carries two fingerprints: `h` of the EMBED INPUT (the first
+// 1,500 characters plus question enrichment; the writer's re-embed trigger)
+// and `t` of the FULL card text, which is what a reader can recompute. A
+// reader accepts a vector when either one proves it was embedded from the
+// card's current text: `t` matches, or `h` matches the full or the truncated
+// text (entries written before `t` existed, and entries an older writer kept
+// across an edit beyond the cap). Enrichment may have changed since; the
+// vector still pictures the card and the writer refreshes it on its next run.
+// An entry with neither fingerprint cannot be tied to any text and is refused.
+// Takes precomputed hashes and references nothing outside itself because
+// brain-semantic.mjs holds a second copy (the one-shot hook cannot import this
+// module). Keep the two identical: test/semantic-hash-parity.mjs compares them.
+export function vectorEntryMatchesText(entry, fullHash, truncatedHash) {
+  try {
+    if (!entry || !entry.v || typeof fullHash !== 'string' || !fullHash) return false;
+    if (typeof entry.t === 'string' && entry.t === fullHash) return true;
+    if (typeof entry.h !== 'string' || !entry.h) return false;
+    if (entry.h === fullHash) return true;
+    const truncated = typeof truncatedHash === 'function' ? truncatedHash() : null;
+    return typeof truncated === 'string' && truncated !== '' && entry.h === truncated;
+  } catch { return false; }
+}
+
+// `accept(id, entry)` decides which stored entries survive the bounded merge:
+// the writer keeps an entry whose embed input is unchanged, the read-only path
+// applies vectorEntryMatchesText. Entries are merged by reference, so `t`
+// rides along from alias files. `held` is what the merge refused, first copy
+// per id, which is the canonical file's copy when it has one, by design (the
+// canonical file is read first): the writer puts it back when it has to
+// persist without having embedded, so a failed run never removes a vector
+// from disk.
+function readCache(brainPath, accept) {
+  if (!BOUNDED) {
+    const key = String(brainPath).replace(/\\/g, '/');
+    const file = path.join(EMB_DIR, sha1(key) + '.json');
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (parsed?.modelKey === EMBEDDING_CACHE_KEY) return { file, cache: parsed, dirty: false };
+      return { file, cache: { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} }, dirty: true };
+    } catch { return { file, cache: { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} }, dirty: false }; }
+  }
+  const candidates = cacheCandidates(brainPath);
+  const file = candidates[0].file;
+  const cache = { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} };
+  const held = {};
+  let found = 0;
+  let canonicalValid = false;
+  let canonicalStale = false;
+  let mergedFromAlias = false;
+  for (const candidate of candidates) {
+    let parsed;
+    try { parsed = JSON.parse(fs.readFileSync(candidate.file, 'utf8')); }
+    catch { continue; }
+    if (!parsed?.cards) continue;
+    const canonical = candidate.file === file;
+    if (parsed.modelKey !== EMBEDDING_CACHE_KEY) {
+      if (canonical) canonicalStale = true;
+      continue;
+    }
+    if (canonical) canonicalValid = true;
+    found++;
+    for (const [id, entry] of Object.entries(parsed.cards)) {
+      if (!entry?.v) continue;
+      if (!accept(id, entry)) {
+        if (!held[id]) held[id] = entry;
+        continue;
+      }
+      if (!cache.cards[id]) {
+        cache.cards[id] = entry;
+        if (!canonical) mergedFromAlias = true;
+      }
+    }
+  }
+  if (found > 1) counters.cacheFilesMerged += found;
+  return {
+    file,
+    cache,
+    held,
+    // A stale legacy alias is harmless once the canonical BGE cache is valid.
+    // Rewrite only when the canonical file itself is stale/missing or an alias
+    // contributes a card the canonical cache did not already contain.
+    dirty: canonicalStale || (!canonicalValid && found > 0) || mergedFromAlias,
+  };
+}
+
+// PREPARING A BRAIN NEVER HOLDS A QUESTION (1.97.0). Embedding every card of a
+// fresh brain takes ~110 ms a card on a laptop CPU (measured 2026-10-11: 100
+// cards 11 s, 3,670 cards 6.8 min), and the old writer did it inside the first
+// question and saved nothing until the end — the agent's call waited minutes
+// and an interrupted run lost everything. Now an interactive caller embeds at
+// most INTERACTIVE_EMBED_BUDGET missing cards (a few seconds) and gets back
+// what is ready; the rest is prepared by the detached, low-priority warm
+// process (bin/klypix-semantic-warm.mjs, maxEmbed: Infinity), which saves as
+// it goes so progress survives an interruption and readers see it.
+export const INTERACTIVE_EMBED_BUDGET = 32;
+const INTERACTIVE_LOCK_WAIT_MS = 3_000;
+const PERSIST_EVERY_MS = 15_000;
+const EMBED_CHUNK = 64;
+
+async function vectorsForBrainUnlocked(pipe, brainPath, cards, opts = {}) {
+  const maxEmbed = Number.isFinite(opts.maxEmbed) ? Math.max(0, opts.maxEmbed) : (opts.maxEmbed === Infinity ? Infinity : INTERACTIVE_EMBED_BUDGET);
+  const stats = opts.stats && typeof opts.stats === 'object' ? opts.stats : {};
+  const want = cards.filter((card) => card.type !== 'container' && (card.text || '').trim());
+  // Question enrichment (1.77): the prompt/intent that produced a card is
+  // appended to its EMBED input — the asker's own vocabulary bridging the
+  // paraphrase gap the 2026-08-17 error analysis measured. Additive and
+  // machine-local like this cache itself; an empty sidecar changes nothing,
+  // and the hash covers the enrichment so its arrival re-embeds exactly the
+  // cards it touches. (Structural context was measured HARMFUL twice — 62%→52%
+  // recall@5 — so only asker-language rides here, never area/tag jargon.)
+  let enrichmentEntries = [];
+  try { enrichmentEntries = readEnrichment(brainPath); } catch { enrichmentEntries = []; }
+  const embedInputFor = (card) => {
+    const base = String(card.text).slice(0, 1500);
+    const extra = enrichmentEntries.length ? enrichmentTextFor(enrichmentEntries, card.text) : '';
+    return extra ? `${base}
+${extra}` : base;
+  };
+  const desiredHashes = new Map(want.map((card) => [card.id, sha1(embedInputFor(card))]));
+  const textHashes = new Map(want.map((card) => [card.id, sha1(card.text)]));
+  const loaded = readCache(brainPath, (id, entry) => entry.h === desiredHashes.get(id));
+  const { file, cache } = loaded;
+  let dirty = loaded.dirty;
+  // Kept entries written before `t` existed, or kept across an edit beyond the
+  // embed cap, get their full-text fingerprint here. Hashing only, never an
+  // embed, and only when it differs, so a settled cache is not rewritten. Only
+  // an entry whose embed input is unchanged qualifies: the unbounded read keeps
+  // stale entries in `cache`, and stamping one would vouch for an old vector.
+  let repaired = 0;
+  for (const card of want) {
+    const entry = cache.cards[card.id];
+    if (!entry || entry.h !== desiredHashes.get(card.id)) continue;
+    if (entry.t !== textHashes.get(card.id)) { entry.t = textHashes.get(card.id); repaired++; }
+  }
+  if (repaired) dirty = true;
+  // Newest first: the cards people ask about most are ready soonest.
+  const missing = want
+    .filter((card) => cache.cards[card.id]?.h !== desiredHashes.get(card.id))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const toEmbed = maxEmbed === Infinity ? missing : missing.slice(0, maxEmbed);
+  stats.wanted = want.length;
+  stats.embedded = 0;
+  stats.pending = missing.length - toEmbed.length;
+  if (toEmbed.length) {
+    let lastPersist = Date.now();
+    for (let offset = 0; offset < toEmbed.length; offset += EMBED_CHUNK) {
+      const chunk = toEmbed.slice(offset, offset + EMBED_CHUNK);
+      let vectors;
+      try { vectors = await embedTexts(pipe, chunk.map((card) => embedInputFor(card))); }
+      catch (error) {
+        // The repair above needs no model, so it lands even when the embed does
+        // not, and so do the chunks already embedded. Everything the merge
+        // refused goes back beside them: those vectors are still on disk and a
+        // reader may still accept them through `t`. The persisted file is a
+        // superset snapshot: it can contain refused entries and entries for
+        // deleted cards. Readers reject them through the acceptance rule, and
+        // the next write that is dirty for another reason trims them.
+        if (repaired || stats.embedded) await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
+        stats.pending = missing.length - stats.embedded;
+        throw error;
+      }
+      chunk.forEach((card, index) => {
+        cache.cards[card.id] = { h: desiredHashes.get(card.id), t: textHashes.get(card.id), v: vectors[index] };
+      });
+      stats.embedded += chunk.length;
+      dirty = true;
+      if (typeof opts.touch === 'function') opts.touch();
+      const more = offset + EMBED_CHUNK < toEmbed.length;
+      // Save as it goes, so a long preparation survives an interruption and
+      // readers (cachedVectorsForBrain) see the progress.
+      if (more && Date.now() - lastPersist >= PERSIST_EVERY_MS) {
+        await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
+        lastPersist = Date.now();
+      }
+      if (typeof opts.onProgress === 'function') {
+        try { opts.onProgress({ done: want.length - (missing.length - stats.embedded), total: want.length }); } catch { /* progress is advisory */ }
+      }
+    }
+  }
+  stats.ready = want.length - stats.pending;
+  const live = new Set(want.map((card) => card.id));
+  for (const id of Object.keys(cache.cards)) {
+    if (!live.has(id)) { delete cache.cards[id]; dirty = true; }
+  }
+  if (dirty) await persistCache(file, cache);
+  const map = new Map();
+  for (const card of want) {
+    const entry = cache.cards[card.id];
+    if (entry?.v) map.set(card.id, entry.v);
+  }
+  return map;
+}
+
+// ── Background preparation: start it, read how far it got ────────────────────
+// startBrainPreparation spawns the detached, low-priority warm process for ONE
+// brain (--only: a question never makes this machine prepare every registered
+// project). At most once a minute per brain from this process; the warm
+// process's own lock makes a second start a no-op. The warm writes its
+// progress to WARM_STATUS_FILE while it runs; brainPreparationStatus reads it
+// so an answer can say how far along the preparation is.
+const WARM_STATUS_FILE = path.join(PB_DIR, '.semantic-update-warm.json');
+const WARM_STALE_MS = 2 * 60_000;
+const lastPreparationStart = new Map();
+
+export function startBrainPreparation(brainPath, { spawnFn = spawn, now = Date.now() } = {}) {
+  if (semanticDisabledByPlugin()) return false;
+  const key = canonicalBrainKey(brainPath);
+  if (now - (lastPreparationStart.get(key) || 0) < 60_000) return false;
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const script = [path.join(here, 'klypix-semantic-warm.mjs'), path.join(here, '..', 'bin', 'klypix-semantic-warm.mjs')]
+    .find((file) => fs.existsSync(file));
+  if (!script) return false;
+  lastPreparationStart.set(key, now);
+  try {
+    const child = spawnFn(process.execPath, [script, '--brain-dir', PB_DIR, '--brain', path.resolve(brainPath), '--only'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env },
+    });
+    child.unref?.();
+    return true;
+  } catch { return false; }
+}
+
+export function brainPreparationStatus(brainPath, { now = Date.now(), statusFile = WARM_STATUS_FILE } = {}) {
+  try {
+    const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    if (status?.result !== 'preparing' || typeof status.brain !== 'string') return null;
+    if (canonicalBrainKey(status.brain) !== canonicalBrainKey(brainPath)) return null;
+    const updated = Date.parse(status.updatedAt || '');
+    if (!Number.isFinite(updated) || now - updated > WARM_STALE_MS) return null; // the run died
+    const done = Number(status.done) || 0, total = Number(status.total) || 0;
+    const started = Date.parse(status.startedAt || '');
+    const ratePerMs = done > 0 && Number.isFinite(started) && updated > started ? done / (updated - started) : null;
+    return { done, total, remainingMs: ratePerMs && total > done ? Math.round((total - done) / ratePerMs) : null };
+  } catch { return null; }
+}
+
+// One sentence an answer carries while a brain is being prepared. `stats`
+// comes from vectorsForBrain; the live progress, when the warm reports it,
+// is fresher.
+export function preparationNotice(brainPath, stats, { usedMeaning = false, now = Date.now() } = {}) {
+  if (!stats || !(stats.pending > 0)) return null;
+  const live = brainPreparationStatus(brainPath, { now });
+  const total = live?.total || stats.wanted || 0;
+  const done = live ? live.done : (stats.ready || 0);
+  const minutes = live?.remainingMs != null
+    ? Math.max(1, Math.round(live.remainingMs / 60_000))
+    // ~45 ms a card measured one at a time; ~0.1 s leaves room for a busy
+    // machine and the low-priority run until the live rate is known.
+    : Math.max(1, Math.round(((total - done) * 0.1) / 60));
+  const n = (x) => Number(x).toLocaleString('en-US');
+  return `Getting this brain ready for search by meaning: ${n(done)} of ${n(total)} cards so far, about ${minutes} min left. `
+    + (usedMeaning
+      ? 'This answer used the cards that are ready plus keywords; it gets better as the rest finish.'
+      : 'This answer used keyword search; ask again when it is done for better matches.');
+}
+
+// READ-ONLY card vectors from the warm cache: never loads the model, never
+// embeds a missing card, never writes. For fast paths (brain_sync task context)
+// that may USE card↔card similarity when it is already paid for — plan ↔ 🏁
+// pairing — and must degrade to lexical bars when it is not. Cards whose text
+// changed since they were embedded are simply absent from the result: a vector
+// is accepted by vectorEntryMatchesText, never by `h` equality, because `h`
+// fingerprints the truncated, enriched embed input a reader cannot recompute.
+// Single-entry memo for the fast path (review 2026-08-23: brain_sync re-parsed
+// a ~36 MB cache on every plan-shaped hit). Keyed by the canonical cache file
+// + mtime + size + the card-hash digest, so a changed card or a rewritten
+// cache invalidates it; ONE brain at a time, vectors only (no parsed JSON
+// retained), so the long-lived worker's heap grows by one vector map, not by
+// every brain it ever touched.
+let _cachedVecMemo = null;
+export function cachedVectorsForBrain(brainPath, cards) {
+  const map = new Map();
+  try {
+    // A card whose text is not a string is skipped, as the hook reader skips
+    // it: `.trim()` on a number used to throw and empty the Map for the brain.
+    const want = (cards || []).filter((card) => card && card.type !== 'container' && typeof card.text === 'string' && card.text.trim());
+    if (!want.length) return map;
+    const desiredHashes = new Map(want.map((card) => [card.id, sha1(String(card.text))]));
+    const file = cacheCandidates(brainPath)[0].file;
+    let stamp = null;
+    try { const st = fs.statSync(file); stamp = `${st.mtimeMs}|${st.size}`; } catch { stamp = null; }
+    const digest = sha1([...desiredHashes.entries()].map(([id, h]) => `${id}:${h}`).sort().join('\n'));
+    if (stamp && _cachedVecMemo && _cachedVecMemo.file === file && _cachedVecMemo.stamp === stamp && _cachedVecMemo.digest === digest) return _cachedVecMemo.map;
+    const texts = new Map(want.map((card) => [card.id, String(card.text)]));
+    const accept = (id, entry) => {
+      const text = texts.get(id);
+      return text !== undefined && vectorEntryMatchesText(
+        entry,
+        desiredHashes.get(id),
+        () => (text.length > 1500 ? sha1(text.slice(0, 1500)) : null),
+      );
+    };
+    const loaded = readCache(brainPath, accept);
+    for (const card of want) {
+      const entry = loaded?.cache?.cards?.[card.id];
+      if (accept(card.id, entry)) map.set(card.id, entry.v);
+    }
+    if (stamp) _cachedVecMemo = { file, stamp, digest, map };
+  } catch { /* cache is best-effort — lexical stays the floor */ }
+  return map;
+}
+
+// opts.maxEmbed: how many missing cards this call may embed — the interactive
+// default is INTERACTIVE_EMBED_BUDGET; the background warm passes Infinity.
+// opts.stats receives { wanted, ready, embedded, pending }; opts.onProgress
+// gets { done, total } after each saved chunk.
+export async function vectorsForBrain(pipe, brainPath, cards, opts = {}) {
+  if (!BOUNDED) return vectorsForBrainUnlocked(pipe, brainPath, cards, opts);
+  const key = canonicalBrainKey(brainPath);
+  const previous = vectorBuildTails.get(key) || Promise.resolve();
+  // A question never waits behind a preparation: it gets INTERACTIVE_LOCK_WAIT_MS,
+  // then reads what the preparation has saved so far (below).
+  const interactive = opts.maxEmbed !== Infinity;
+  const run = previous.catch(() => {}).then(() => withCrossProcessCacheLock(
+    brainPath,
+    (touch) => vectorsForBrainUnlocked(pipe, brainPath, cards, { ...opts, touch }),
+    interactive ? INTERACTIVE_LOCK_WAIT_MS : CACHE_LOCK_TIMEOUT_MS,
+  ));
+  vectorBuildTails.set(key, run);
+  try { return await run; }
+  catch (error) {
+    if (!interactive || error?.code !== 'KLYPIX_SEMANTIC_CACHE_BUSY') throw error;
+    // The background preparation holds the lock: answer from what it has saved.
+    const map = cachedVectorsForBrain(brainPath, cards);
+    const wanted = cards.filter((card) => card && card.type !== 'container' && typeof card.text === 'string' && card.text.trim()).length;
+    if (opts.stats && typeof opts.stats === 'object') Object.assign(opts.stats, { wanted, ready: map.size, embedded: 0, pending: Math.max(0, wanted - map.size), busy: true });
+    return map;
+  }
+  finally { if (vectorBuildTails.get(key) === run) vectorBuildTails.delete(key); }
+}
+
+async function scoreRerankBatch(rr, question, hits, startIndex) {
+  const texts = hits.map((hit) => String(hit.card?.text || '').slice(0, 1500));
+  let inputs = null;
+  let outputs = null;
+  try {
+    inputs = rr.tokenizer(new Array(texts.length).fill(String(question)), {
+      text_pair: texts,
+      padding: true,
+      truncation: true,
+    });
+    outputs = await rr.model(inputs);
+    const logits = outputs?.logits;
+    if (!logits?.data || logits.data.length < hits.length) throw new Error('reranker returned invalid logits');
+    const scores = Array.from(logits.data.slice(0, hits.length), Number);
+    return hits.map((hit, index) => ({ hit, score: scores[index], index: startIndex + index }));
+  } finally {
+    const seen = new Set();
+    disposeTensorTree(outputs, seen);
+    disposeTensorTree(inputs, seen);
+  }
+}
+
+export async function rerankHits(rr, question, hits) {
+  if (!hits.length) return [];
+  if (!BOUNDED) {
+    counters.rerankBatches++;
+    const scored = await scoreRerankBatch(rr, question, hits, 0);
+    return scored.sort((a, b) => b.score - a.score || a.index - b.index).map((entry) => entry.hit);
+  }
+  const scored = [];
+  for (let offset = 0; offset < hits.length; offset += RERANK_BATCH_SIZE) {
+    const batch = hits.slice(offset, offset + RERANK_BATCH_SIZE);
+    counters.rerankBatches++;
+    const part = await withInferenceSlot(
+      'reranking',
+      () => scoreRerankBatch(rr, question, batch, offset),
+    );
+    scored.push(...part);
+  }
+  return scored.sort((a, b) => b.score - a.score || a.index - b.index).map((entry) => entry.hit);
+}
+
+export async function disposeSemanticModels() {
+  clearSemanticIdleTimer();
+  return enqueueMaintenance(() => disposeModelsUnlocked('explicit'));
+}
+
+// Hermetic lifecycle hooks for the memory regression suite. Production callers
+// use only the public load/query/dispose surface above.
+export const __semanticMemoryTest = {
+  installModels({ embedder = null, reranker = null } = {}) {
+    embedderPromise = embedder ? Promise.resolve(embedder) : null;
+    rerankerPromise = reranker ? Promise.resolve(reranker) : null;
+    lastSemanticActivityAt = Date.now();
+  },
+  forceIdleDisposal() {
+    return enqueueMaintenance(() => disposeModelsUnlocked('idle'));
+  },
+  armIdleDisposal: armSemanticIdleDisposal,
+  clearIdleTimer: clearSemanticIdleTimer,
+};

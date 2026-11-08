@@ -1,0 +1,11 @@
+{
+  "name": "klypix-mcp",
+  "version": "1.112.0",
+  "private": true,
+  "description": "Bundled copy of klypix-mcp 1.112.0 (MIT) used by the KLYPIX plugin. Its dependencies are declared and locked in the plugin root package.json.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
