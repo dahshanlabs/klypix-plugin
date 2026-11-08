@@ -1,0 +1,1011 @@
+// agent-rules — make a project's brain.klypix AUTOMATIC for EVERY agent tool, not
+// just Claude Code. Claude Code gets the brain via hooks (settings.json, see
+// klypix-install). Other agents (Cursor, Cline, Windsurf, Copilot/VS Code, Gemini
+// CLI, Aider, and the AGENTS.md cross-tool standard) have no hook system — so we
+// drop their NATIVE files:
+//
+//   • an MCP server config  → the agent CAN reach the brain's tools
+//   • a rules / instructions → the agent is TOLD to read the brain at task start and
+//                              capture decisions, on every session, automatically
+//
+// Agent-neutral by construction: the brain DATA is one shared brain.klypix; this just
+// teaches each tool to use it. Idempotent — owned files are rewritten wholesale; shared
+// files (AGENTS.md, copilot-instructions.md, GEMINI.md) get a fenced block merged in
+// place, never clobbering the user's own content. Pure fs/path; never throws for one bad
+// target.
+//
+// DRIFT-AWARE (added 1.13.0): the managed fence now carries `v=<brainVersion>` +
+// `hash=<contentHash>` so a projected block is CLASSIFIABLE without re-writing it —
+// ok / stale (older brain) / hand-edited (content changed inside the block) / missing.
+// `linkProject(dir, { check:true })` returns that audit without touching disk; it's what
+// `npx klypix-mcp link --check` and `brain_doctor`'s harness layer read. Closes the
+// audited "harness projection is write-once, drift is undetectable" gap.
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import crypto from 'crypto';
+import { fileURLToPath } from 'url';
+import { entryEnvWithTools } from './tool-profile.mjs';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// Explicit assignments are separate from stopping a whole session. Keep the
+// prompt classifier and reminders shared by the Claude and Codex hook paths.
+// A reminder is advisory: it never creates a card, launches an agent, or
+// authorizes work beyond the human's request.
+const ASSIGNMENT_AGENT = '(?:Claude(?: Code)?|Codex|ChatGPT|another (?:agent|session))';
+const ASSIGNMENT_WORK = '(?:tasks?|assignments?|prompts?|briefs?|work|research)';
+const ASSIGNMENT_SEND_RE = new RegExp(
+  `\\b(?:assign|delegate|send|give|hand)\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_AGENT}\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_WORK}\\b|` +
+  `\\b(?:assign|delegate|send|give|prepare|write|create|save)\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,60}\\b(?:to|for|with)\\s+(?:the\\s+)?${ASSIGNMENT_AGENT}\\b`, 'i');
+const ASSIGNMENT_PICKUP_RE = new RegExp(
+  `\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,100}\\b(?:assigned|delegated|sent|saved|left)\\b[^.!?\\n]{0,60}\\b(?:by|from)\\s+${ASSIGNMENT_AGENT}\\b|` +
+  `\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,60}\\b${ASSIGNMENT_AGENT}\\b[^.!?\\n]{0,40}\\b(?:assigned|delegated|sent|saved|left)\\b|` +
+  `\\b${ASSIGNMENT_AGENT}(?:['’]s)?\\s+(?:assigned|delegated|saved)\\b[^.!?\\n]{0,60}\\b${ASSIGNMENT_WORK}\\b|` +
+  `\\b(?:do|find|read|start|continue|pick up|take)\\b[^.!?\\n]{0,60}\\b(?:assigned|delegated)\\s+(?:task|assignment|work)\\b`, 'i');
+const ASSIGNMENT_NEGATED_RE = /\b(?:don't|do not|never|stop)\s+(?:\w+\s+){0,2}(?:assign|delegate|send|give|write|create|save|take|do|find|read|start|continue)\b/i;
+export function assignmentPromptKind(prompt) {
+  const clauses = String(prompt || '').split(/[.!?\n]+/).filter(s => !ASSIGNMENT_NEGATED_RE.test(s));
+  if (clauses.some(s => ASSIGNMENT_PICKUP_RE.test(s))) return 'pickup';
+  if (clauses.some(s => ASSIGNMENT_SEND_RE.test(s))) return 'send';
+  return null;
+}
+export const ASSIGNMENT_SAVE_GUIDANCE = 'For a user-authorized assignment to another agent, use its reported client or role from same-project brain_sync peers when available (a chat called ChatGPT may report Codex); otherwise keep the named recipient. Save it before replying with brain_handoff {action:"write", reason:"assignment", for:"<agent or role>", title, task, instructions, next, files, verify}. Put the full brief, constraints, acceptance criteria and output paths in instructions; do this even while you continue other work. Confirm the returned card id, then use brain_message with that id when the recipient session is known from brain_sync or brain_doctor. If it is not connected, leave the saved card for its next brain_sync. Do not substitute a copy-and-paste prompt because you cannot launch ChatGPT or Codex. Saving or messaging does not start or wake an agent.';
+export const ASSIGNMENT_PICKUP_GUIDANCE = 'When asked to do another agent\'s assigned task, call brain_sync with this project root, then brain_handoff {action:"list"} if needed; use the addressed assignment\'s id with {action:"read", id}, then {action:"take", id}. Read the complete saved instructions and check the current user request before starting. An explicit assignment is its own scope, not a takeover of the sender\'s whole conversation; ordinary unfinished-session handoffs still require their conversation review. If the assignment is missing, ask its sender through brain_message instead of asking the human to paste it. Take only the assignment the user authorized.';
+export function assignmentPromptHint(prompt) {
+  const kind = assignmentPromptKind(prompt);
+  return kind ? `🤝 KLYPIX assignment: ${kind === 'send' ? ASSIGNMENT_SAVE_GUIDANCE : ASSIGNMENT_PICKUP_GUIDANCE}` : '';
+}
+
+
+// ── The MCP launch entry (auto-propagation, part A) ──────────────────────────
+// Reliability root-cause fix: an emitted `npx -y klypix-mcp` config runs whatever
+// npx has WARM-CACHED — a publish never reaches it, so the running server silently
+// lags the installed bundle (the 1.20.0 incident: doctor said current, the live
+// server ran pre-1.20.0). Prefer the INSTALLED local bundle
+// (~/.claude/project-brain/klypix-mcp-server.mjs): it is the SAME artifact the
+// hooks + doctor use (one version, no npx cache, works offline) and the self-update
+// hook keeps it current. Fall back to npx ONLY when the bundle isn't installed yet —
+// first-run bootstrap; the very next link/install flips it to local.
+export function localBundleServer(home = os.homedir()) {
+  return path.join(home, '.claude', 'project-brain', 'klypix-mcp-server.mjs');
+}
+
+// Keep checked-in project MCP configs portable while still launching the
+// installed, offline-safe bundle. `node -e` has no script pathname in argv, so
+// insert a harmless placeholder before importing the server; the server can
+// then keep reading its normal arguments from process.argv.slice(2).
+export const LOCAL_BUNDLE_EVAL = [
+  "process.argv.splice(1,0,'klypix-mcp-server.mjs');",
+  "import(require('url').pathToFileURL(require('path').join(",
+  "require('os').homedir(),'.claude','project-brain','klypix-mcp-server.mjs')).href)",
+].join('');
+
+// `env` (1.112.0): string-valued variables the entry passes to the server —
+// KLYPIX_TOOLS (the tool profile, src/tool-profile.mjs) is the one install
+// writes. Omitted when empty, so an entry without env is byte-identical to
+// what every earlier version wrote.
+export function mcpServerEntry({ vault = '.', withType = false, home, env } = {}) {
+  let base;
+  try {
+    const local = localBundleServer(home);
+    if (fs.statSync(local).isFile()) {
+      base = { command: 'node', args: ['-e', LOCAL_BUNDLE_EVAL, '--', '--vault', vault] };
+    }
+  } catch { /* no local bundle yet → bootstrap via npx below */ }
+  if (!base) base = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', vault] };
+  const vars = env && typeof env === 'object' && !Array.isArray(env)
+    ? Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === 'string'))
+    : {};
+  if (Object.keys(vars).length) base.env = vars;
+  return withType ? { type: 'stdio', ...base } : base;
+}
+
+// The env of the klypix-canvas entry in a project MCP config (JSON `mcpServers` /
+// `servers`, or the Codex TOML) — `{}` when it has none, null when there is no
+// entry. What doctor reads to say which tool profile a host will launch.
+export function readMcpEntryEnv(file) {
+  if (!exists(file)) return null;
+  if (/\.toml$/i.test(file)) {
+    const parsed = safeReadCodexConfig(file);
+    if (!parsed.ok) return null;
+    const name = Object.keys(parsed.servers).find((k) => /klypix/i.test(k));
+    return name ? { ...(parsed.servers[name].env || {}) } : null;
+  }
+  let cfg;
+  // An editor on Windows may save the file with a UTF-8 BOM, which JSON.parse refuses.
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '') || '{}'); } catch { return null; }
+  const bag = cfg?.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers
+    : cfg?.servers && typeof cfg.servers === 'object' ? cfg.servers : null;
+  const entry = bag?.['klypix-canvas'];
+  if (!entry || typeof entry !== 'object') return null;
+  const env = entry.env && typeof entry.env === 'object' && !Array.isArray(entry.env) ? entry.env : {};
+  return Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === 'string'));
+}
+
+// Codex uses TOML rather than the JSON MCP shape used by the other clients.
+// These helpers replace only KLYPIX-owned table sections, preserving comments,
+// formatting, and every unrelated setting byte-for-byte. They intentionally do
+// not serialize the whole document.
+const CODEX_GLOBAL_START = '<!-- klypix-codex:start (managed by klypix-mcp) -->';
+const CODEX_GLOBAL_END = '<!-- klypix-codex:end -->';
+const CODEX_GLOBAL_RE = /<!-- klypix-codex:start \(managed by klypix-mcp\) -->[\s\S]*?<!-- klypix-codex:end -->\r?\n?/;
+const CODEX_GLOBAL_BODY = [
+  CODEX_GLOBAL_START,
+  '## KLYPIX project brains',
+  '',
+  'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
+  'At task start, call `brain_sync` with the current project root in `project`, a one-sentence intent,',
+  'and expected files before editing. In `files`, use exact project-relative FILE paths only—never',
+  'directories, glob patterns, or filename slugs. This explicit root prevents cross-project routing in IDE hosts.',
+  'It returns compact task-relevant memory plus active-task/message/file-overlap coordination.',
+  'Call phase `"checkpoint"` only when material file scope changes, and phase `"complete"` only when',
+  'the task work genuinely ends.',
+  'Read `.claude/brain-brief.md` only when `brain_sync` says context is insufficient or the task asks',
+  'for broad history/status; otherwise use `brain_ask` for deeper targeted retrieval.',
+  'To reach another agent session on this project, call `brain_message` with its session id (from',
+  '`brain_sync` or `brain_doctor`); a session that has closed receives the note when it next starts.',
+  'Never ask the human to carry a message between agents — send it and say it was sent or queued.',
+  'If a tool named here is not available, the install uses the `core` tool profile (brain_sync, brain_note, brain_ask,',
+  'brain_message, brain_handoff, brain_rules); ask for `npx klypix-mcp install --tools all`.',
+  ASSIGNMENT_SAVE_GUIDANCE,
+  ASSIGNMENT_PICKUP_GUIDANCE,
+  'Stopping before the work is done (limit, end of day, blocked)? Call `brain_handoff` {action:"write"} with what is done, what is next, files and how to verify;',
+  'the next session of any agent sees it at its first `brain_sync` and takes it with {action:"take"}. Asked to continue what another session left? Take it there first.',
+  'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
+  'If the project has no `brain.klypix`, ignore this section.',
+  CODEX_GLOBAL_END,
+].join('\n');
+
+const tomlKey = (value) => /^[A-Za-z0-9_-]+$/.test(String(value)) ? String(value) : JSON.stringify(String(value));
+const tomlString = (value) => JSON.stringify(String(value));
+const eolOf = (raw) => raw.includes('\r\n') ? '\r\n' : '\n';
+
+function parseTomlDottedKey(source) {
+  const out = [];
+  let token = '';
+  let quote = null;
+  let escaped = false;
+  const push = () => {
+    const s = token.trim();
+    token = '';
+    if (!s) return false;
+    if (s.startsWith('"')) {
+      try { out.push(JSON.parse(s)); } catch { return false; }
+    } else if (s.startsWith("'")) {
+      if (s.length < 2 || !s.endsWith("'")) return false;
+      out.push(s.slice(1, -1));
+    } else {
+      if (!/^[A-Za-z0-9_-]+$/.test(s)) return false;
+      out.push(s);
+    }
+    return true;
+  };
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote === '"') {
+      token += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      token += ch;
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; token += ch; continue; }
+    if (ch === '.') { if (!push()) return null; continue; }
+    token += ch;
+  }
+  if (quote || !push()) return null;
+  return out;
+}
+
+function scanTomlMultiline(line, initial) {
+  let state = initial;
+  let i = 0;
+  while (i < line.length) {
+    if (state) {
+      let at = line.indexOf(state, i);
+      while (state === '"""' && at >= 0) {
+        let slashes = 0;
+        for (let j = at - 1; j >= 0 && line[j] === '\\'; j--) slashes++;
+        if (slashes % 2 === 0) break;
+        at = line.indexOf(state, at + 3);
+      }
+      if (at < 0) return state;
+      state = null;
+      i = at + 3;
+      continue;
+    }
+    const ch = line[i];
+    if (ch === '#') break;
+    const tri = line.slice(i, i + 3);
+    if (tri === '"""' || tri === "'''") { state = tri; i += 3; continue; }
+    if (ch === '"') {
+      i++;
+      let escaped = false;
+      while (i < line.length) {
+        const c = line[i++];
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') break;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      const close = line.indexOf("'", i + 1);
+      i = close < 0 ? line.length : close + 1;
+      continue;
+    }
+    i++;
+  }
+  return state;
+}
+
+function scanTomlTables(raw) {
+  const tables = [];
+  const lines = raw.match(/[^\r\n]*(?:\r\n|\n|\r|$)/g) || [];
+  let offset = 0;
+  let multiline = null;
+  for (const fullLine of lines) {
+    if (!fullLine) continue;
+    const line = fullLine.replace(/(?:\r\n|\n|\r)$/, '').replace(/^\uFEFF/, '');
+    if (!multiline) {
+      const array = line.match(/^[ \t]*\[\[(.+)\]\][ \t]*(?:#.*)?$/);
+      const table = array ? null : line.match(/^[ \t]*\[([^\[\]].*)\][ \t]*(?:#.*)?$/);
+      const match = array || table;
+      if (match) {
+        const parts = parseTomlDottedKey(match[1].trim());
+        if (!parts) return { ok: false, error: 'contains a table header KLYPIX cannot safely parse', tables: [] };
+        tables.push({ start: offset, end: raw.length, parts, array: !!array });
+      }
+    }
+    multiline = scanTomlMultiline(line, multiline);
+    offset += fullLine.length;
+  }
+  if (multiline) return { ok: false, error: 'contains an unterminated multiline TOML string', tables: [] };
+  for (let i = 0; i < tables.length - 1; i++) tables[i].end = tables[i + 1].start;
+  return { ok: true, tables };
+}
+
+function parseTomlStringValue(rawValue) {
+  const value = rawValue.trim();
+  if (value.startsWith('"')) {
+    const m = value.match(/^"((?:\\.|[^"])*)"/);
+    if (!m) return null;
+    try { return JSON.parse(`"${m[1]}"`); } catch { return null; }
+  }
+  const m = value.match(/^'([^']*)'/);
+  return m ? m[1] : null;
+}
+
+export function safeReadCodexConfig(configPath) {
+  if (!exists(configPath)) return { ok: true, raw: '', servers: {} };
+  let raw;
+  try { raw = fs.readFileSync(configPath, 'utf8'); }
+  catch (e) { return { ok: false, raw: '', servers: {}, error: `Can't read ${configPath}: ${e?.message || e}` }; }
+  const scanned = scanTomlTables(raw);
+  if (!scanned.ok) {
+    return { ok: false, raw, servers: {}, error: `${path.basename(configPath)} ${scanned.error}. Fix it first - KLYPIX left it untouched.` };
+  }
+  const servers = {};
+  for (const table of scanned.tables) {
+    if (table.array || table.parts[0] !== 'mcp_servers' || table.parts.length < 2) continue;
+    const name = String(table.parts[1]);
+    if (servers[name]) continue; // nested .env/.tools table for an existing server
+    const block = raw.slice(table.start, table.end);
+    const commandLine = block.match(/^[ \t]*command[ \t]*=[ \t]*(.+)$/m);
+    const command = commandLine ? parseTomlStringValue(commandLine[1]) : null;
+    const cwdLine = block.match(/^[ \t]*cwd[ \t]*=[ \t]*(.+)$/m);
+    const cwd = cwdLine ? parseTomlStringValue(cwdLine[1]) : null;
+    const launchesKlypix = /(?:klypix-mcp-server\.mjs|(?:^|["'\s,])klypix-mcp(?:["'\s,]|$))/i.test(block)
+      && !!command && /(?:^|[\\/])(node|node\.exe|npx|npx\.cmd|cmd|cmd\.exe)$/i.test(command);
+    // The server's env: Codex accepts an inline table on the server itself
+    // (`env = { KLYPIX_TOOLS = "core" }`, what KLYPIX writes) or a nested
+    // `[mcp_servers.<name>.env]` table (what a person may write by hand).
+    const inlineEnv = block.match(/^[ \t]*env[ \t]*=[ \t]*\{(.*)\}[ \t]*(?:#.*)?$/m);
+    const env = inlineEnv ? parseTomlInlineEnv(inlineEnv[1]) : {};
+    servers[name] = { command, cwd, launchesKlypix, raw: block, env };
+  }
+  for (const table of scanned.tables) {
+    if (table.array || table.parts[0] !== 'mcp_servers' || table.parts.length !== 3 || table.parts[2] !== 'env') continue;
+    const server = servers[String(table.parts[1])];
+    if (!server) continue;
+    for (const line of raw.slice(table.start, table.end).split(/\r?\n/).slice(1)) {
+      const kv = line.match(/^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.+)$/);
+      if (!kv) continue;
+      const value = parseTomlStringValue(kv[2]);
+      if (value != null) server.env[kv[1]] = value;
+    }
+  }
+  return { ok: true, raw, servers, tables: scanned.tables };
+}
+
+// `KEY = "value", OTHER = 'v'` → { KEY: 'value', OTHER: 'v' } (string values only).
+function parseTomlInlineEnv(inner) {
+  const env = {};
+  const re = /([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*("(?:\\.|[^"\\])*"|'[^']*')/g;
+  let m;
+  while ((m = re.exec(inner))) {
+    const value = parseTomlStringValue(m[2]);
+    if (value != null) env[m[1]] = value;
+  }
+  return env;
+}
+
+function renderCodexMcpTable(name, entry, cwd) {
+  const args = Array.isArray(entry?.args) ? entry.args.map(tomlString).join(', ') : '';
+  const lines = [
+    `[mcp_servers.${tomlKey(name)}]`,
+    `command = ${tomlString(entry?.command || 'npx')}`,
+    `args = [${args}]`,
+  ];
+  if (cwd) lines.push(`cwd = ${tomlString(cwd)}`);
+  // The server's env (KLYPIX_TOOLS, the tool profile) as a TOML inline table on
+  // the server, so the whole entry stays one table KLYPIX owns and replaces.
+  const envPairs = Object.entries(entry?.env || {})
+    .filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string');
+  if (envPairs.length) lines.push(`env = { ${envPairs.map(([key, value]) => `${key} = ${tomlString(value)}`).join(', ')} }`);
+  // A cold npx bootstrap can exceed Codex's 10 second default; local installs
+  // start immediately, but the larger timeout is harmless and makes first use reliable.
+  lines.push('startup_timeout_sec = 120');
+  return lines.join('\n');
+}
+
+function writeCodexConfig(configPath, raw, next) {
+  try {
+    ensureDir(configPath);
+    let backup;
+    if (raw) {
+      backup = configPath + '.klypix-bak';
+      try { fs.writeFileSync(backup, raw, 'utf8'); } catch { backup = undefined; }
+    }
+    const tmp = configPath + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    const verify = safeReadCodexConfig(tmp);
+    if (!verify.ok) { try { fs.unlinkSync(tmp); } catch { /* best effort */ } return { ok: false, error: verify.error }; }
+    fs.renameSync(tmp, configPath);
+    return { ok: true, backup };
+  } catch (e) {
+    return { ok: false, error: `Couldn't write ${configPath}: ${e?.message || e}` };
+  }
+}
+
+// `tools` ({ value, onlyNew }) is the KLYPIX_TOOLS policy (src/tool-profile.mjs
+// entryEnvWithTools): the table keeps the env it already has; a new table gets
+// `value`; `onlyNew: false` writes `value` into an existing table too.
+export function connectCodexMcpServer({ configPath, name = 'klypix-canvas', entry, cwd, tools = null } = {}) {
+  const parsed = safeReadCodexConfig(configPath);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const existingNames = Object.keys(parsed.servers).filter(k => /klypix/i.test(k));
+  const chosen = existingNames[0] || name;
+  const prior = existingNames.length ? parsed.servers[chosen] : null;
+  const env = entryEnvWithTools({ ...(prior?.env || {}), ...(entry?.env || {}) }, tools, !prior);
+  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])));
+  const eol = eolOf(parsed.raw);
+  const block = renderCodexMcpTable(chosen, { ...entry, env }, cwd).replace(/\n/g, eol);
+  let next = parsed.raw;
+  if (owned.length) {
+    const firstStart = owned[0].start;
+    for (const table of [...owned].sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, table.start) + (table.start === firstStart ? block + eol + eol : '') + next.slice(table.end);
+    }
+  } else {
+    const needsEol = next.length > 0 && !/[\r\n]$/.test(next);
+    const spacer = next.trim() ? eol : '';
+    next += (needsEol ? eol : '') + spacer + block + eol + eol;
+  }
+  if (next === parsed.raw) {
+    return { ok: true, action: 'unchanged', name: chosen, path: configPath, otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)) };
+  }
+  const written = writeCodexConfig(configPath, parsed.raw, next);
+  if (!written.ok) return written;
+  return {
+    ok: true,
+    action: existingNames.length ? 'updated' : 'connected',
+    name: chosen,
+    path: configPath,
+    backup: written.backup,
+    otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)),
+  };
+}
+
+// The --vault a KLYPIX Codex table passes, or null when it passes none.
+function codexTableVault(block) {
+  const argsLine = String(block || '').match(/^[ \t]*args[ \t]*=[ \t]*\[(.*)\][ \t]*$/m);
+  if (!argsLine) return null;
+  const values = [...argsLine[1].matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)].map(m => {
+    if (m[1] === undefined) return m[2];
+    try { return JSON.parse(`"${m[1]}"`); } catch { return m[1]; }
+  });
+  const at = values.indexOf('--vault');
+  return at >= 0 && at + 1 < values.length ? values[at + 1] : null;
+}
+const isAbsoluteAnywhere = (p) => path.win32.isAbsolute(p) || path.posix.isAbsolute(p);
+
+// onlyRelativeVault: remove only the KLYPIX tables whose --vault is RELATIVE
+// (the pre-1.35 global `--vault "."` entry, which a global Codex process
+// resolves from its own install folder). `install` uses it: the table KLYPIX's
+// Settings → Codex button writes carries an absolute vault, and removing it
+// greyed that button. Uninstall still removes every KLYPIX table.
+export function disconnectCodexMcpServer({ configPath, onlyRelativeVault = false } = {}) {
+  const parsed = safeReadCodexConfig(configPath);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])))
+    .filter(t => {
+      if (!onlyRelativeVault) return true;
+      const vault = codexTableVault(parsed.servers[String(t.parts[1])]?.raw ?? parsed.raw.slice(t.start, t.end));
+      return vault != null && !isAbsoluteAnywhere(vault);
+    });
+  if (!owned.length) return { ok: true, action: 'unchanged', path: configPath };
+  let next = parsed.raw;
+  for (const table of [...owned].sort((a, b) => b.start - a.start)) {
+    next = next.slice(0, table.start) + next.slice(table.end);
+  }
+  const written = writeCodexConfig(configPath, parsed.raw, next);
+  if (!written.ok) return written;
+  return {
+    ok: true,
+    action: 'disconnected',
+    path: configPath,
+    backup: written.backup,
+    otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)),
+  };
+}
+
+export function mergeCodexGlobalInstructions(home = os.homedir()) {
+  const file = path.join(home, '.codex', 'AGENTS.md');
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { /* fresh file */ }
+  const eol = eolOf(raw);
+  const block = CODEX_GLOBAL_BODY.replace(/\n/g, eol);
+  const next = CODEX_GLOBAL_RE.test(raw)
+    ? raw.replace(CODEX_GLOBAL_RE, block + eol)
+    : (raw.trim() ? raw.replace(/\s*$/, '') + eol + eol + block + eol : block + eol);
+  if (next === raw) return { ok: true, action: 'unchanged', path: file };
+  try {
+    ensureDir(file);
+    let backup;
+    if (raw) { backup = file + '.klypix-bak'; try { fs.writeFileSync(backup, raw, 'utf8'); } catch { backup = undefined; } }
+    const tmp = file + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    fs.renameSync(tmp, file);
+    return { ok: true, action: CODEX_GLOBAL_RE.test(raw) ? 'updated' : 'connected', path: file, backup };
+  } catch (e) { return { ok: false, error: `Couldn't write ${file}: ${e?.message || e}` }; }
+}
+
+export function removeCodexGlobalInstructions(home = os.homedir()) {
+  const file = path.join(home, '.codex', 'AGENTS.md');
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return { ok: true, action: 'unchanged', path: file }; }
+  if (!CODEX_GLOBAL_RE.test(raw)) return { ok: true, action: 'unchanged', path: file };
+  const next = raw.replace(CODEX_GLOBAL_RE, '').replace(/^\s+|\s+$/g, (m, offset) => offset === 0 ? '' : '\n');
+  try {
+    const backup = file + '.klypix-bak';
+    try { fs.writeFileSync(backup, raw, 'utf8'); } catch { /* best effort */ }
+    const tmp = file + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    fs.renameSync(tmp, file);
+    return { ok: true, action: 'disconnected', path: file, backup };
+  } catch (e) { return { ok: false, error: `Couldn't write ${file}: ${e?.message || e}` }; }
+}
+
+export function codexGlobalInstructionsInstalled(home = os.homedir()) {
+  try { return CODEX_GLOBAL_RE.test(fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8')); }
+  catch { return false; }
+}
+
+const sha8 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
+const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
+
+// The klypix-mcp version this projection was written from — stamped into the fence so a
+// later session can tell a stale block (older brain) from a hand-edited one. Read from
+// package.json walking up from this file (the flat ~/.claude runtime has no versioned
+// package.json, but `link` always runs from the npm package, where it does). Overridable
+// via linkProject(dir, { version }).
+export function resolveVersion() {
+  let dir = HERE;
+  for (; ;) {
+    try { const v = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).version; if (v) return v; } catch { /* keep walking */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) return '0.0.0';
+    dir = parent;
+  }
+}
+
+// Keep the hook-generated fallback block in AGENTS.md bounded. MCP-aware agents
+// get task-ranked context from brain_sync; this block exists only for agents
+// that have neither MCP context nor lifecycle hooks. `link` calls this after it
+// updates the managed instruction fence so existing adopters shed oversized
+// query-blind briefs immediately instead of waiting for a later capture hook.
+export async function compactAgentsBrief(projectDir, { check = false, budgetChars = 3200 } = {}) {
+  const dir = path.resolve(projectDir || process.cwd());
+  const agentsFile = path.join(dir, 'AGENTS.md');
+  const brainFile = ['brain.klypix', 'brain.any']
+    .map((name) => path.join(dir, name))
+    .find((file) => {
+      try { return fs.statSync(file).isFile(); } catch { return false; }
+    });
+  if (!brainFile || !fs.existsSync(agentsFile)) return { status: 'skipped', action: 'skipped', reason: 'no brain/AGENTS.md' };
+  const raw = fs.readFileSync(agentsFile, 'utf8');
+  const start = '<!-- klypix-brain-brief:start -->';
+  const end = '<!-- klypix-brain-brief:end -->';
+  const re = /<!-- klypix-brain-brief:start -->[\s\S]*?<!-- klypix-brain-brief:end -->/;
+  if (!re.test(raw)) return { status: 'skipped', action: 'skipped', reason: 'no generated brief block' };
+  try {
+    const { parseKlypix, structToUltraBrief } = await import('./klypix-format.mjs');
+    const { struct } = await parseKlypix(fs.readFileSync(brainFile));
+    const brief = structToUltraBrief(struct, {
+      briefPath: '.claude/brain-brief.md',
+      budgetChars: Math.max(1200, Math.min(5000, Number(budgetChars) || 3200)),
+    }).trim();
+    const block = `${start}\n<!-- compact fallback only; brain_sync supplies task-ranked context -->\n${brief}\n${end}`;
+    const next = raw.replace(re, block);
+    if (next === raw) return { status: 'ok', action: 'unchanged', bytes: Buffer.byteLength(block) };
+    if (check) return { status: 'stale', action: 'check', bytes: Buffer.byteLength(block) };
+    atomicWrite(agentsFile, next);
+    return { status: 'ok', action: 'updated', bytes: Buffer.byteLength(block) };
+  } catch (error) {
+    return { status: 'error', action: 'error', reason: error?.message || String(error) };
+  }
+}
+
+// The one canonical instruction every agent gets. Tool-and-CLI dual so it works whether
+// or not the agent has the klypix-canvas MCP wired.
+const BRAIN_INSTRUCTIONS = `## KLYPIX project brain
+
+This project has a **spatial brain** at \`./brain.klypix\` — the living memory of its
+decisions, open questions, and findings (the shared human↔agent memory for this repo).
+Treat it as authoritative project context, and as **the place project knowledge lives** so it
+survives across sessions, agents, and context resets.
+
+**At the start of a task — read it** so you know the project's state and past decisions:
+- first call \`brain_sync\` with this project's absolute root path in \`project\`, a one-sentence task
+  intent, and the files you expect to touch. In \`files\`, use exact project-relative FILE paths only—
+  never directories, glob patterns, or filename slugs. The explicit root keeps each repository on its
+  own brain even when an IDE launches MCP servers from the IDE installation directory.
+  It returns a compact task-relevant memory capsule, meaningful active-task peers, one-time messages,
+  exact file-overlap warnings, and automatic late-arrival alerts without host hooks.
+  Call phase \`"checkpoint"\` only when material file scope changes, and phase \`"complete"\` only when
+  the task work genuinely ends.
+- do NOT automatically read the full \`.claude/brain-brief.md\`; open it only when \`brain_sync\`
+  says its compact context is insufficient or the task asks for broad project history/status.
+- with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
+- if a tool named here is not available, the install uses the \`core\` tool profile (brain_sync, brain_note,
+  brain_ask, brain_message, brain_handoff, brain_rules); ask for \`npx klypix-mcp install --tools all\`.
+- or via CLI: \`npx -y -p klypix-mcp klypix-read brain.klypix\`
+
+**When you make a real decision, finding, or milestone — capture it HERE** so it persists for the next session/agent:
+- with MCP: call \`brain_note\` with a one-line decision, or
+- emit a marker line in your output: \`🧠 BRAIN [Area]: <one-line decision>\`, or
+- via CLI: \`echo "🧠 BRAIN [Area]: <decision>" | npx -y -p klypix-mcp klypix-append brain.klypix\`
+
+Capture **sparingly** — real decisions / milestones / open questions / reusable gotchas, not routine
+steps — and capture it **at the moment you decide** (a one-line marker inline), not batched or left in
+a scratch file to rot. Link related cards with \`[[other-card]]\`. To **correct a stale card**, include
+the word \`CORRECTION\` (or "was WRONG" / "OBSOLETE" — UPPERCASE, the deliberate signal) in the
+decision — capture then supersedes the stale card across ALL areas (archived with an arrow + a
+receipt, restorable if wrong). Suspect stale facts survive somewhere? Run \`brain_reconcile\` — it
+surfaces contradiction candidates to confirm.
+
+**Memory routing (important).** If your host has its OWN memory/notes store, that is for *user*
+preferences and how to work with this person — keep using it for that. But **project** knowledge
+(decisions, milestones, open questions, gotchas) belongs in THIS brain: it is the shared, portable
+memory the whole team and every agent reads, not a private scratchpad only you can see. Never let a
+project decision live *only* in your host's memory or a scratch file — put it here so the next
+session/agent has it.
+
+**Working alongside other sessions?** Send a coordination note with the \`brain_message\` MCP
+tool ("merged the hook refactor — rebase before you commit"), addressed to a session id from
+\`brain_sync\` / \`brain_doctor\`, or to "all". A live session gets it on its next lifecycle event or
+KLYPIX tool call and it replays until that session records uptake with \`brain_message_receipt\`
+or moves on; a session that has CLOSED still receives a directed note the moment it next starts
+(kept up to 7 days). **Never make the human carry a message between agents:** if you would
+otherwise ask the human to relay or paste something to another agent session, send it with
+\`brain_message\` instead and tell the human it was sent or queued — hand them the text only if
+\`brain_message\` refuses. Notes are ephemeral, NOT brain cards — durable decisions still go
+through \`brain_note\`.
+
+**Assigning work to another agent?** ${ASSIGNMENT_SAVE_GUIDANCE}
+
+**Picking up an assigned task?** ${ASSIGNMENT_PICKUP_GUIDANCE}
+
+**Stopping before the work is done?** (the human asks for a handoff, your context or usage limit
+is near, the day ends, you are blocked, you are switching tool) Call \`brain_handoff\`
+{action:"write"} with the task, what is done, what is NEXT in order, the files and how to verify.
+It is a 🤝 card in this brain the human can see and correct, and the next session on this project —
+any agent — sees it at its first \`brain_sync\` / session start and takes it with {action:"take"},
+then {action:"done"} when finished. KLYPIX also records every session's last reply, files,
+commits and the checkouts it worked in (with their uncommitted files) automatically, so
+\`brain_sync\` may list **unfinished work** another session left without a card: if the human asks
+you to continue it, take it with \`brain_handoff\` {action:"take", session:"<id>"} first, and look
+first in the checkout the record names — it may be a side folder, not the project. That list is history, not a lock — a stopped session holds no claim on its
+files. A LIVE session's uncommitted edits are its work in progress: never sweep, discard or stash them
+(\`git add -A\`, \`commit -a\`, \`reset --hard\`, \`stash\`); commit only your own files. A stopped session's leftovers
+are yours to finish and commit when you are continuing its work; never discard them without the human. Never ask the human to paste a summary into the next session.
+
+**A note that asks agents to keep off a file**, whatever its wording (here, in AGENTS.md / CLAUDE.md or any
+notes file) can outlive the work it protected. Before you obey one, or before you edit the file
+anyway, call \`brain_sync\` with that file in \`files\`: KLYPIX checks the note against live sessions,
+unmerged local branches and registered worktrees. Decide which kind of note it is: a temporary
+reservation for someone's in-flight change ends when that work ends; a permanent rule (generated
+file, policy, legal or human restriction) always holds, whatever the evidence says. If a temporary
+reservation's work has ended and your task needs the file, change it there and tell the human so
+they can remove the note — never delete the note yourself. An incomplete check says UNKNOWN.
+
+**Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
+
+// Content fingerprint of the canonical instructions — stamped into the fence so a
+// hand-edit INSIDE the block (body != what its hash claims) is detectable.
+const INSTRUCTIONS_HASH = sha8(BRAIN_INSTRUCTIONS);
+
+const FENCE_END = '<!-- klypix-brain:end -->';
+// Versioned + hashed start marker. The attrs are between `start` and the closing `-->`,
+// so the BROAD FENCE_RE (which matches any start…end) still replaces an OLD unstamped
+// block on the next `link` — the upgrade is idempotent.
+const fenceStart = (ver) => `<!-- klypix-brain:start v=${ver} hash=${INSTRUCTIONS_HASH} (automatically managed by klypix-mcp) -->`;
+const FENCE_RE = /<!--\s*klypix-brain:start[\s\S]*?klypix-brain:end\s*-->/;
+// Capturing parse: v=(group1) hash=(group2) inner-body(group3). Attrs optional so a
+// legacy unstamped block parses too (version/hash come back undefined → treated as stale).
+const FENCE_PARSE_RE = /<!--\s*klypix-brain:start(?:\s+v=([0-9][0-9.]*))?(?:\s+hash=([0-9a-f]+))?[\s\S]*?-->([\s\S]*?)<!--\s*klypix-brain:end\s*-->/;
+
+const fencedBlock = (ver) => `${fenceStart(ver)}\n${BRAIN_INSTRUCTIONS}\n${FENCE_END}`;
+
+const exists = (p) => { try { fs.statSync(p); return true; } catch { return false; } };
+const ensureDir = (p) => fs.mkdirSync(path.dirname(p), { recursive: true });
+
+// Harness refreshes can run unattended after a runtime update or at the first
+// brain_sync for a project. Never expose a truncated rules/config file to an
+// agent host: stage beside the target, close the complete file, then
+// atomically replace. A crash leaves either the complete old file or complete
+// new file; a stray temp is harmless and is removed on the failure path.
+function atomicWrite(file, content) {
+  ensureDir(file);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.klypix-tmp`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing staged / already moved */ }
+    throw error;
+  }
+}
+
+// Parse a managed block out of arbitrary file text → { version, hash, body } | null.
+function parseFence(text) {
+  const m = String(text || '').match(FENCE_PARSE_RE);
+  if (!m) return null;
+  return { version: m[1] || null, hash: m[2] || null, body: m[3] || '' };
+}
+
+// Classify a projected fenced file WITHOUT writing (the drift audit). THE single
+// source of truth for both check AND write: fenceMerge/writeDedicated skip a file
+// IFF this says 'ok', so classify-ok ⇔ link-unchanged can never disagree (the 1.16
+// adversarial review found three ways they used to: an unrepairable hand-edited
+// stamp, an invisible frontmatter strip, and a check-ok-but-link-downgrades skew).
+//   missing      — file absent, or present but carries no managed block
+//   hand-edited  — block body no longer matches the hash it was stamped with; or
+//                   (owned dedicated files) anything OUTSIDE the fence drifted —
+//                   e.g. a stripped `alwaysApply:`/`trigger:` frontmatter, which
+//                   silently disables the rule in Cursor/Windsurf
+//   ok           — block body is EXACTLY what we'd project today AND the stamp is
+//                   consistent with it — regardless of the stamped version. CONTENT
+//                   is the contract, the stamp is provenance: a version-only bump
+//                   must NOT re-drift every adopter into a re-link treadmill. A
+//                   self-consistent block stamped NEWER than the running brain is
+//                   also 'ok' (and link leaves it alone — never downgrade).
+//   stale        — block body differs from today's instructions AND was stamped from
+//                   an older brain (or is a legacy unstamped block) → re-link refreshes
+const STAMP_RE = /<!--\s*klypix-brain:start[\s\S]*?-->/;
+function classifyFenced(file, version, frontmatter = null) {
+  if (!exists(file)) return { status: 'missing' };
+  const raw = fs.readFileSync(file, 'utf8');
+  const fence = parseFence(raw);
+  if (!fence) return { status: 'missing' };
+  // Normalize CRLF before hashing (matching norm() in the frontmatter branch
+  // below): the stamped hash is always computed from the LF-only canonical
+  // instructions, so a git-autocrlf checkout or CRLF-saving editor flipped
+  // EVERY projected file to hand-edited at once — the destructive-repair class
+  // — when the true status was a losslessly healable 'stale' (2026-07-29 audit,
+  // the likely cause of "9/14 HAND-EDITED at the same stamp").
+  const bodyHash = sha8(fence.body.replace(/\r\n/g, '\n').trim());
+  if (fence.hash && bodyHash !== fence.hash) return { status: 'hand-edited', stampedVersion: fence.version };
+  const bodyCurrent = bodyHash === INSTRUCTIONS_HASH;
+  const stampConsistent = !fence.hash || fence.hash === INSTRUCTIONS_HASH;
+  if (bodyCurrent && stampConsistent) {
+    // Owned dedicated files are OURS wholesale — frontmatter included. Compare the
+    // whole file modulo the stamp line so a frontmatter strip/flip reads as drift.
+    if (frontmatter !== null) {
+      const norm = (s) => String(s).replace(STAMP_RE, '<STAMP>').replace(/\r\n/g, '\n').trim();
+      const expected = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
+      if (norm(raw) !== norm(expected)) return { status: 'hand-edited', stampedVersion: fence.version || null, why: 'frontmatter/layout drifted' };
+    }
+    return { status: 'ok', stampedVersion: fence.version || null };
+  }
+  if (!fence.version) return { status: 'stale', stampedVersion: null };
+  if (cmpSemver(fence.version, version) < 0) return { status: 'stale', stampedVersion: fence.version };
+  return { status: 'ok', stampedVersion: fence.version };
+}
+
+// Shared markdown (AGENTS.md, copilot-instructions.md, GEMINI.md): merge our fenced
+// block in place, preserving the user's own prose outside the fence.
+// A hand-edited file is about to be rebuilt wholesale — keep the human's version.
+// One rolling .klypix-bak per file (repair stops being an all-or-nothing choice).
+function backupHandEdited(file, status) {
+  if (status !== 'hand-edited' || !exists(file)) return;
+  try { fs.copyFileSync(file, file + '.klypix-bak'); } catch { /* best-effort */ }
+}
+
+function fenceMerge(file, version) {
+  // Zero-touch IFF the audit says 'ok' (same classifier, so check and write can
+  // never disagree): current+consistent block → byte-identical file, no stamp-only
+  // churn; a hand-edited stamp or stale body falls through and gets rebuilt.
+  const status = classifyFenced(file, version).status;
+  if (status === 'ok') return { action: 'unchanged' };
+  backupHandEdited(file, status);
+  let cur = '';
+  let had = false;
+  if (exists(file)) { cur = fs.readFileSync(file, 'utf8'); had = true; }
+  const block = fencedBlock(version);
+  let next;
+  let action;
+  if (FENCE_RE.test(cur)) { next = cur.replace(FENCE_RE, block); action = 'updated'; }
+  else if (cur.trim()) { next = cur.replace(/\s*$/, '') + '\n\n' + block + '\n'; action = 'merged'; }
+  else { next = block + '\n'; action = had ? 'merged' : 'created'; }
+  if (next === cur) return { action: 'unchanged' };
+  atomicWrite(file, next);
+  return { action };
+}
+
+// Owned dedicated rules file: rewrite wholesale (optional frontmatter for always-apply).
+function writeDedicated(file, frontmatter, version) {
+  // Zero-touch IFF the audit says 'ok' — which for owned dedicated files includes
+  // the frontmatter (a stripped alwaysApply/trigger MUST be repaired, not skipped).
+  const status = classifyFenced(file, version, frontmatter || '').status;
+  if (status === 'ok') return { action: 'unchanged' };
+  backupHandEdited(file, status);
+  const had = exists(file);
+  const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
+  atomicWrite(file, body);
+  return { action: had ? 'updated' : 'created' };
+}
+
+// Project-level MCP config: add the klypix-canvas server, preserving any sibling servers.
+// wrapKey differs by tool: Cursor/Claude use "mcpServers"; VS Code uses "servers".
+// `tools` ({ value, onlyNew } | null): the KLYPIX_TOOLS policy. The entry keeps
+// the env it already has — a re-link (brain_sync, the updater, `link`) never
+// changes a person's tool profile; `install` passes { value: 'core', onlyNew:
+// true } so only an entry it CREATES gets the core profile, and `install --tools
+// X` passes { value: X, onlyNew: false }.
+function mergeMcpJson(file, wrapKey, withType, projectDir, tools = null) {
+  // Prefer the installed local bundle (no npx warm-cache staleness); npx only as a
+  // first-run bootstrap. Migrating an existing npx entry → local is exactly the
+  // desync fix, so a re-link (or the self-update install) heals stale configs.
+  // These files are natively project-scoped and commonly committed. Keep their
+  // vault portable; brain_sync's explicit `project` field is the second routing
+  // guard if a host nevertheless launches from an unexpected directory.
+  let cfg = {};
+  if (exists(file)) {
+    const raw = fs.readFileSync(file, 'utf8');
+    if (raw.trim()) { try { cfg = JSON.parse(raw); } catch { return { action: 'skipped', why: 'invalid JSON — left untouched' }; } }
+  }
+  if (!cfg[wrapKey] || typeof cfg[wrapKey] !== 'object' || Array.isArray(cfg[wrapKey])) cfg[wrapKey] = {};
+  const prior = cfg[wrapKey]['klypix-canvas'];
+  const env = entryEnvWithTools(prior && typeof prior === 'object' ? prior.env : undefined, tools, !prior);
+  const entry = mcpServerEntry({ vault: '.', withType, env });
+  const before = JSON.stringify(prior);
+  cfg[wrapKey]['klypix-canvas'] = entry;
+  if (JSON.stringify(cfg[wrapKey]['klypix-canvas']) === before) return { action: 'unchanged' };
+  atomicWrite(file, JSON.stringify(cfg, null, 2) + '\n');
+  return { action: before === undefined ? 'created' : 'updated' };
+}
+
+// Check-only classifier for an MCP json: is the klypix-canvas server wired AND does
+// its entry still actually launch klypix-mcp? Presence alone isn't enough — a hand-edit
+// that mangles the command/args (so the server never starts) reads as "wired" but is
+// broken. We DON'T strict-hash the entry: a customized `--vault <path>` is legitimate,
+// so only the invocation (npx/node … klypix-mcp …) must survive; if it doesn't, that's
+// drift the user needs to re-`link`.
+function classifyMcp(file, wrapKey, projectDir) {
+  if (!exists(file)) return { status: 'missing' };
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); }
+  catch { return { status: 'hand-edited', why: 'invalid JSON' }; }
+  const entry = cfg?.[wrapKey]?.['klypix-canvas'];
+  if (!entry) return { status: 'missing' };
+  const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
+  const launches = (entry.command === 'npx' || entry.command === 'node') && args.some(a => a.includes('klypix-mcp'));
+  const vaultIndex = args.indexOf('--vault');
+  const vaultArg = vaultIndex >= 0 ? args[vaultIndex + 1] : null;
+  const expected = path.resolve(projectDir);
+  const bound = vaultArg === '.'
+    || (!!vaultArg && path.isAbsolute(vaultArg) && path.resolve(vaultArg) === expected);
+  if (!launches) return { status: 'hand-edited', why: 'entry no longer launches klypix-mcp' };
+  if (!bound) return { status: 'hand-edited', why: `entry points outside this project (${expected})` };
+  return { status: 'ok' };
+}
+
+// The projection map — the single source of truth shared by WRITE (linkProject) and
+// CHECK (auditProject), so the two can never disagree about what's projected where.
+//
+// `editors` (1.71.0) names which detected hosts justify writing each file, so a
+// project stops collecting managed config for tools nobody on the machine has.
+// `standard: true` marks the cross-tool AGENTS.md convention — justified by ANY
+// agent host rather than one specific id. Filtering only happens when a caller
+// passes an explicit editor set; the default projects everything, exactly as
+// before, so every existing caller is unaffected.
+function targets(projectDir) {
+  const j = (...p) => path.join(projectDir, ...p);
+  return {
+    rules: [
+      { tool: 'Codex / AGENTS.md standard', file: j('AGENTS.md'), kind: 'merge', editors: ['codex'], standard: true },
+      { tool: 'Cursor', file: j('.cursor', 'rules', 'klypix-brain.mdc'), kind: 'dedicated', editors: ['cursor'], frontmatter: '---\ndescription: KLYPIX project brain — read at task start, capture decisions\nalwaysApply: true\n---' },
+      { tool: 'Windsurf', file: j('.windsurf', 'rules', 'klypix-brain.md'), kind: 'dedicated', editors: ['windsurf'], frontmatter: '---\ntrigger: always_on\n---' },
+      { tool: 'Cline', file: j('.clinerules', 'klypix-brain.md'), kind: 'dedicated', editors: ['cline'], frontmatter: '' },
+      { tool: 'GitHub Copilot', file: j('.github', 'copilot-instructions.md'), kind: 'merge', editors: ['copilot'] },
+      // Added 1.13.0 — close the "not generated at all" coverage gap the audit flagged.
+      { tool: 'Gemini CLI', file: j('GEMINI.md'), kind: 'merge', editors: ['gemini-cli', 'antigravity'] },
+      { tool: 'Aider', file: j('CONVENTIONS.md'), kind: 'dedicated', editors: ['aider'], frontmatter: '' },
+      // Added 1.29.1 — Antigravity (Gemini IDE) reads .agents/AGENTS.md; the desktop
+      // app already writes it (projectBrainConnect.ts), this adds CLI audit coverage.
+      // kind:'merge' so the fenced block coexists with any existing content.
+      { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge', editors: ['antigravity'] },
+      // Intentionally NO project CLAUDE.md target. Claude receives the same task
+      // contract mechanically through lifecycle hooks + MCP tool instructions;
+      // the desktop legacy connector still owns CLAUDE.md, so a second Core
+      // writer here would create duelling managed blocks and update churn.
+    ],
+    mcp: [
+      { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml', editors: ['codex'] },
+      { tool: 'Claude Code', file: j('.mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['claude-code'] },
+      { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['cursor'] },
+      { tool: 'Cline', file: j('.cline', 'mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['cline'] },
+      { tool: 'Gemini CLI / Antigravity', file: j('.gemini', 'settings.json'), wrapKey: 'mcpServers', withType: false, editors: ['gemini-cli', 'antigravity'] },
+      { tool: 'VS Code (Copilot/Continue)', file: j('.vscode', 'mcp.json'), wrapKey: 'servers', withType: true, editors: ['vscode', 'copilot'] },
+    ],
+  };
+}
+
+/**
+ * Should this target be projected, given the hosts detected on the machine?
+ *
+ * Three independent yeses, in order of strength:
+ *  1. a detected host reads it;
+ *  2. it is the cross-tool AGENTS.md standard and SOME agent host is present;
+ *  3. the file already exists in the project — a teammate committed it, so it
+ *     stays current whether or not THIS machine has that editor. Without this
+ *     rule a one-editor developer would silently stop maintaining the configs
+ *     the rest of their team depends on.
+ */
+function targetJustified(target, editors, anyEditor) {
+  if (!editors) return true;                                        // unfiltered: project everything
+  if ((target.editors || []).some((id) => editors.has(id))) return true;
+  if (target.standard && anyEditor) return true;
+  return exists(target.file);
+}
+
+const relFile = (projectDir, abs) => path.relative(projectDir, abs).replace(/\\/g, '/');
+
+/** The project MCP config files KLYPIX projects, as `{ tool, file }` (absolute). */
+export function projectMcpConfigFiles(projectDir) {
+  return targets(projectDir).mcp.map((m) => ({ tool: m.tool, file: m.file }));
+}
+
+/**
+ * Wire a project so EVERY agent tool reads + captures its brain automatically — or,
+ * with { check:true }, AUDIT the projection without touching disk.
+ * @param {string} projectDir absolute project root (holds ./brain.klypix)
+ * @param {{ version?: string, check?: boolean, editors?: Set<string>|string[], tools?: { value: string, onlyNew?: boolean }|null }} [opts]
+ *   editors — when supplied, project only what a detected host actually reads
+ *   (plus files the project already carries). Omit for the legacy write-all.
+ *   tools — the KLYPIX_TOOLS policy for the MCP entries (see mergeMcpJson);
+ *   omitted, every entry keeps the env it has.
+ * @returns {{ rules, mcp, hasBrain, version, check, skipped: Array }}
+ */
+export function linkProject(projectDir, opts = {}) {
+  const version = opts.version || resolveVersion();
+  const check = !!opts.check;
+  const tools = opts.tools && opts.tools.value ? opts.tools : null;
+  const t = targets(projectDir);
+  const hasBrain = exists(path.join(projectDir, 'brain.klypix')) || exists(path.join(projectDir, 'brain.any'));
+
+  const editors = opts.editors == null ? null
+    : (opts.editors instanceof Set ? opts.editors : new Set(opts.editors));
+  const anyEditor = !!editors && editors.size > 0;
+  // Files the caller has decided not to touch at all — used by the automatic
+  // setup path to leave a project-owned (vendored, repo-relative) server alone.
+  // An explicitly typed `link` still rewrites everything; an action the user
+  // did not ask for should be more conservative than one they did.
+  const exclude = opts.exclude instanceof Set ? opts.exclude
+    : new Set(Array.isArray(opts.exclude) ? opts.exclude : []);
+  const skipped = [];
+  const keep = (target) => {
+    const file = relFile(projectDir, target.file);
+    if (exclude.has(file)) {
+      skipped.push({ tool: target.tool, file, why: 'project-owned server — left untouched' });
+      return false;
+    }
+    if (targetJustified(target, editors, anyEditor)) return true;
+    skipped.push({ tool: target.tool, file, why: 'not installed on this machine' });
+    return false;
+  };
+  t.rules = t.rules.filter(keep);
+  t.mcp = t.mcp.filter(keep);
+
+  const rules = t.rules.map((r) => {
+    const file = relFile(projectDir, r.file);
+    try {
+      if (check) return { tool: r.tool, file, ...classifyFenced(r.file, version, r.kind === 'dedicated' ? (r.frontmatter || '') : null) };
+      const res = r.kind === 'merge' ? fenceMerge(r.file, version) : writeDedicated(r.file, r.frontmatter, version);
+      return { tool: r.tool, file, ...res };
+    } catch (error) {
+      return { tool: r.tool, file, action: 'skipped', status: 'error', why: error?.message || String(error) };
+    }
+  });
+
+  const boundProject = path.resolve(projectDir).replace(/\\/g, '/');
+  // Codex needs an exact machine-local path because its app/extension currently
+  // ignores relative project cwd for MCP. Other hosts use their native
+  // project-scoped configs plus brain_sync's explicit project fallback.
+  const mcp = t.mcp.map((m) => {
+    const file = relFile(projectDir, m.file);
+    try {
+      if (m.format === 'toml') {
+        if (check) {
+          const parsed = safeReadCodexConfig(m.file);
+          if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
+          const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
+          const entry = name ? parsed.servers[name] : null;
+          const vaultMatch = entry?.raw?.match(/^[ \t]*args[ \t]*=[ \t]*\[[\s\S]*?["']--vault["'][ \t]*,[ \t]*["']([^"']+)["']/m);
+          const configuredVault = vaultMatch?.[1] || null;
+          const bound = !!configuredVault
+            && path.isAbsolute(configuredVault)
+            && path.resolve(configuredVault) === path.resolve(projectDir)
+            && !!entry?.cwd
+            && path.isAbsolute(entry.cwd)
+            && path.resolve(entry.cwd) === path.resolve(projectDir);
+          return {
+            tool: m.tool,
+            file,
+            status: entry ? (entry.launchesKlypix && bound ? 'ok' : 'hand-edited') : 'missing',
+            why: entry && !entry.launchesKlypix
+              ? 'entry no longer launches klypix-mcp'
+              : entry && !bound
+                ? `Codex MCP is not explicitly bound to this project (${boundProject})`
+                : undefined,
+          };
+        }
+        const boundEntry = mcpServerEntry({ vault: boundProject });
+        const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject, tools });
+        return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
+      }
+      if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey, projectDir) };
+      return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir, tools) };
+    } catch (error) {
+      return { tool: m.tool, file, action: 'skipped', status: 'error', why: error?.message || String(error) };
+    }
+  });
+
+  return { rules, mcp, hasBrain, version, check, skipped };
+}
+
+/**
+ * Check-only harness audit (no writes) — the harness layer of brain_doctor / the body
+ * of `npx klypix-mcp link --check`. Rolls the per-file classification into drift sets.
+ * @returns {{ files, drift, unprojected, ok, version }}
+ */
+export function auditProject(projectDir, opts = {}) {
+  const { rules, mcp, version, skipped } = linkProject(projectDir, { ...opts, check: true });
+  const files = [...rules, ...mcp];
+  const ACTIONABLE = new Set(['missing', 'stale', 'hand-edited']);
+  const drift = files.filter((f) => ACTIONABLE.has(f.status));
+  // `skipped` (1.82.1): targets the caller's editor filter excluded — hosts this machine
+  // does not have. Reported so a verdict can SAY what it did not audit instead of
+  // silently narrowing; drift is judged only over what a present host would read.
+  return { files, drift, ok: drift.length === 0, version, skipped: skipped || [] };
+}
+
+export { BRAIN_INSTRUCTIONS, INSTRUCTIONS_HASH, FENCE_RE, parseFence, cmpSemver };

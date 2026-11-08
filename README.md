@@ -2,7 +2,7 @@
 
 **One project. One shared understanding.**
 
-![Two sessions, Claude Code and Codex, on one PC and one brain.klypix. Both plan to change src/checkout/Checkout.tsx, and each gets a heads-up from KLYPIX. Nothing is blocked. The film ends on the KLYPIX mark and "Every project gets a brain."](https://raw.githubusercontent.com/dahshanlabs/klypix-plugin/main/assets/klypix-sessions.gif)
+![Two sessions, Claude Code and Codex, on one PC and one brain.klypix. Both plan to change src/checkout/Checkout.tsx, and each gets a heads-up from KLYPIX. Nothing is blocked. The film ends on the KLYPIX mark and "Every project gets a brain."](https://raw.githubusercontent.com/dahshanlabs/klypix-plugin/cc91974/assets/klypix-sessions.gif)
 
 <sub>Two agent sessions on one computer, one project brain: each gets a heads-up when they plan to change the same file. A 14-second cut of the sessions film on klypix.com. [Real output from the server this plugin runs](https://github.com/dahshanlabs/klypix-mcp/blob/master/docs/demo/demo.gif), rendered by its CI.</sub>
 
@@ -47,11 +47,11 @@ new terminal, and only after you say yes.
 /plugin install klypix@klypix
 ```
 
-**Requirements:** Node.js 20 or later, with `npx` on your `PATH`. The plugin
-works with or without the KLYPIX desktop app.
+**Requirements:** Node.js 20 or later on your `PATH`. The plugin works with or
+without the KLYPIX desktop app.
 
 **Getting a brain.** The brain workflow switches on in projects that contain a
-`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.107.1 init` in
+`brain.klypix` at their root. To create one, run `npx klypix-mcp@1.112.0 init` in
 the project folder, or use the KLYPIX desktop app. In a project without a
 `brain.klypix`, the canvas tools still work and the brain workflow stays off.
 
@@ -100,13 +100,18 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
 
 ### What runs
 
-- When a Claude Code session starts, Claude Code runs
-  `npx -y klypix-mcp@1.107.1`. The first time, npx downloads the `klypix-mcp`
-  package, version 1.106.0 exactly, from the public npm registry; later starts
-  use npm's cache. **klypix-mcp's own dependencies are resolved by npm at
-  install time** within the version ranges klypix-mcp declares
-  (`@modelcontextprotocol/sdk`, `@modelcontextprotocol/ext-apps`, `jszip`,
-  `jpeg-js`, `zod`, `fractional-indexing`).
+- **The server's code ships inside this plugin**, in [`server/`](server/): a
+  copy of klypix-mcp 1.112.0 (MIT), started with
+  `node ${CLAUDE_PLUGIN_ROOT}/server/bin/klypix-mcp.mjs`. Nothing is
+  downloaded and run at start-up. [`server/VENDORED.md`](server/VENDORED.md)
+  says exactly which upstream release it is and the one change made to it.
+- **Its dependencies are locked.** [`package.json`](package.json) and
+  [`package-lock.json`](package-lock.json) pin every package by exact version,
+  registry address and hash (`@modelcontextprotocol/sdk`,
+  `@modelcontextprotocol/ext-apps`, `jszip`, `jpeg-js`, `zod`,
+  `fractional-indexing` and what they use; none has an install script). Claude
+  Code installs them from that lockfile when it installs or updates the
+  plugin.
 - The server is a small supervisor process plus one Node.js worker process. It
   talks to Claude Code over standard input and output. **It opens no network
   port and runs no listener.** On Windows it can connect, as a client, to the
@@ -124,9 +129,9 @@ this plugin sets; it changes how the MCP server behaves and nothing else.
 
 - **Update itself.** It never asks npm for a newer release and never installs
   one, whatever `KLYPIX_AUTO_UPDATE` is set to. You run the version this plugin
-  pins; a newer version reaches you only in a new plugin release.
-- **Run code from outside the package.** It runs only the worker inside the
-  pinned package. It never starts or switches to the copy that
+  ships; a newer version reaches you only in a new plugin release.
+- **Run code from outside the plugin.** It runs only the server inside this
+  plugin's `server/` folder. It never starts or switches to the copy that
   `npx klypix-mcp install` puts in `~/.claude/project-brain`, and it never loads
   the optional on-device semantic model, so search is keyword-only and no model
   weights are downloaded.
@@ -230,11 +235,12 @@ that have a note waiting.
 
 ### Network
 
-Plugin mode makes two kinds of request, and both go to the public npm registry:
+The plugin itself makes two kinds of request, and both go to the public npm
+registry:
 
-- **Package download:** npx fetches `klypix-mcp@1.107.1` and its dependencies
-  when the plugin starts the server (and again only if npm's cache no longer
-  has them).
+- **Dependency install:** when you install or update the plugin, Claude Code
+  installs the locked dependencies listed in `package-lock.json`. Starting the
+  server downloads nothing.
 - **Optional version check:** one `npm view klypix-mcp version`, only when
   Claude calls `brain_doctor` with `check_npm: true`.
 

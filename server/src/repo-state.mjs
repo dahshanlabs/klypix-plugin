@@ -1,0 +1,1029 @@
+// Mechanical repo-state context (2026-08-14 bundle-currency incident).
+//
+// Two near-misses on the same day proved that release-critical git state must
+// be STRUCTURED DATA in every sync response, not recall an agent may or may
+// not exercise in time: a desktop release was almost built against a sibling
+// source checkout sitting on a feature branch at an UNPUBLISHED version, and a
+// whole release train shipped from an off-trunk branch because nothing made
+// branch state visible at the moment of action. The only gate that caught the
+// first incident lived in ONE consumer repo's prebuild script — invisible to
+// every MCP client. This module is the host-neutral engine home for that
+// knowledge: it runs inside the server, so a Codex, Cursor, Cline, or Desktop
+// session is exactly as protected as a Claude one (no hook required).
+//
+// Contract:
+//   • collectRepoState(projectDir) → { branch, headShort, packageVersion,
+//     tagsAtHead, isReleaseTag, aheadBehindOrigin, siblings[], durationMs }
+//     or null. Null means "no usable git state" — callers OMIT the block.
+//   • Zero network: every signal is a local git read (the upstream comparison
+//     uses the local tracking ref — never a fetch).
+//   • Never throws. Detached HEAD, no git, no tags, no package.json, no remote
+//     all degrade to nulls/empties or to omission of the whole block.
+//   • Bounded: short per-spawn timeouts, at most MAX_SIBLINGS sibling repos,
+//     and a 60s per-process cache so repeated brain_syncs stay cheap — the
+//     first sync of a session pays the git spawns, the rest hit the cache.
+//   • Stateless on disk: unlike observeShipDrift this keeps NO baseline file,
+//     so a fresh session on an already-drifted repo still sees the drift, and
+//     the ship-observation baseline is never perturbed.
+
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { execFileSync, spawnSync } from 'child_process';
+
+// Same shape as the presence-side gitBranch / resolveAuthor probes: short
+// timeout, stderr discarded, failure is data (null), never an exception.
+const GIT_TIMEOUT_MS = 1500;
+// The incident shape is ONE bundled core next to ONE source checkout; three is
+// already generous. A monorepo with dozens of packages/* must not turn every
+// sync into a git storm.
+const MAX_SIBLINGS = 3;
+const MAX_PACKAGE_ENTRIES = 40;
+const MAX_TAGS_AT_HEAD = 8;
+const CACHE_MS = 60_000;
+
+// resolved projectDir → { at, state } (state may be null — "not a repo" is
+// worth caching too, or every sync in a non-git project re-pays the spawn).
+const repoStateCache = new Map();
+
+function defaultExecGit(args, cwd, timeoutMs) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    // Most probes are rev-parse-fast; patch-id work needs its own budget.
+    timeout: Number(timeoutMs) > 0 ? Number(timeoutMs) : GIT_TIMEOUT_MS,
+  });
+}
+
+const makeGit = (execGit) => (cwd, args, timeoutMs) => {
+  try {
+    const out = execGit(args, cwd, timeoutMs);
+    return typeof out === 'string' ? out.trim() : null;
+  } catch {
+    return null;   // no git on PATH, not a repo, timeout — all the same: no data
+  }
+};
+
+// ── Test-merge two sessions' branches (git merge-tree) ───────────────────────
+// Declared-file overlap misses the conflicts that matter most at merge time:
+// on 715 pairs of concurrently open agent PRs, 79 of 167 textual conflicts
+// (47%) happened although the two PRs' own file lists did not overlap — each
+// side was compared against a different base (arXiv 2610.04779). A real
+// three-way test merge of the two branch tips catches them, and costs a median
+// 0.02 s (git >= 2.38, `merge-tree --write-tree`, no working tree touched).
+//
+// Contract: committed work only (an uncommitted edit is invisible to git), never
+// throws, null whenever the answer is unknown — git too old (exit 129), unrelated
+// histories (128), a branch that does not exist in THIS repo (a teammate's PC),
+// a timeout, or a ref name that is not safe to hand to git.
+
+// Files the brain tooling regenerates on every branch, so they differ between
+// almost any two branches and a "conflict" in them is projection noise, not
+// work at risk. brain.klypix has its own merge driver. The rest mirror
+// uninstall.mjs PROJECT_TARGETS (test/overlap-tiers.mjs fails if they drift).
+export const MERGE_NOISE_PATHS = Object.freeze([
+  'brain.klypix', 'brain.any',
+  'agents.md', '.agents/agents.md', 'gemini.md', 'conventions.md',
+  '.cursor/rules/klypix-brain.mdc', '.windsurf/rules/klypix-brain.md', '.clinerules/klypix-brain.md',
+  '.github/copilot-instructions.md', '.codex/config.toml',
+  '.mcp.json', '.cursor/mcp.json', '.cline/mcp.json', '.gemini/settings.json', '.vscode/mcp.json',
+]);
+const MERGE_NOISE = new Set(MERGE_NOISE_PATHS);
+export const isMergeNoise = (file) => {
+  const key = String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase();
+  if (!key) return true;
+  const base = key.slice(key.lastIndexOf('/') + 1);
+  return MERGE_NOISE.has(key) || base === 'brain.klypix' || base === 'brain.any';
+};
+
+// A branch name we will put on a git command line: no leading dash (option
+// injection), no "..", no reflog/revision syntax, no whitespace.
+const SAFE_BRANCH = /^(?!-)(?!.*\.\.)(?!.*@\{)[A-Za-z0-9._/+-]{1,200}$/;
+export const isSafeBranchName = (name) => typeof name === 'string' && SAFE_BRANCH.test(name) && !name.endsWith('/') && !name.endsWith('.lock');
+
+function defaultRunMergeTree(args, cwd, timeoutMs) {
+  const r = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: Number(timeoutMs) > 0 ? Number(timeoutMs) : GIT_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return { status: r.error ? null : r.status, stdout: typeof r.stdout === 'string' ? r.stdout : '' };
+}
+
+const mergeTreeCache = new Map();   // `${dir}|${shaA}|${shaB}` → result (tips are immutable)
+const MERGE_TREE_CACHE_MAX = 200;
+
+/**
+ * Test-merge the tips of two local branches without touching any working tree.
+ * Returns { clean, files, shaA, shaB, noiseOnly } or null when unknown.
+ * `files` are the conflicted paths minus MERGE_NOISE_PATHS.
+ */
+export function mergeTreeConflicts(dir, branchA, branchB, {
+  execGit = defaultExecGit,
+  runMergeTree = defaultRunMergeTree,
+  timeoutMs = 1500,
+} = {}) {
+  if (!dir || !isSafeBranchName(branchA) || !isSafeBranchName(branchB) || branchA === branchB) return null;
+  const git = makeGit(execGit);
+  const shaA = git(dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${branchA}^{commit}`]);
+  const shaB = git(dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${branchB}^{commit}`]);
+  if (!shaA || !shaB || !/^[0-9a-f]{7,64}$/i.test(shaA) || !/^[0-9a-f]{7,64}$/i.test(shaB)) return null;
+  if (shaA === shaB) return { clean: true, files: [], shaA, shaB, noiseOnly: false };
+  const key = `${dir}|${shaA}|${shaB}`;
+  if (mergeTreeCache.has(key)) return mergeTreeCache.get(key);
+  let res = null;
+  try { res = runMergeTree(['merge-tree', '--write-tree', '--name-only', '--no-messages', shaA, shaB], dir, timeoutMs); } catch { res = null; }
+  let out = null;
+  if (res && res.status === 0) out = { clean: true, files: [], shaA, shaB, noiseOnly: false };
+  else if (res && res.status === 1) {
+    // Line 1 is the merged tree's OID; the conflicted file names follow, one
+    // per line, until a blank line (informational messages are suppressed).
+    const lines = String(res.stdout || '').split(/\r?\n/);
+    const all = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) break;
+      all.push(line);
+    }
+    const files = [...new Set(all)].filter((f) => !isMergeNoise(f));
+    out = { clean: files.length === 0, files, shaA, shaB, noiseOnly: all.length > 0 && files.length === 0 };
+  }
+  if (out) {
+    if (mergeTreeCache.size >= MERGE_TREE_CACHE_MAX) mergeTreeCache.delete(mergeTreeCache.keys().next().value);
+    mergeTreeCache.set(key, out);
+  }
+  return out;
+}
+
+export function __resetMergeTreeCacheForTests() { mergeTreeCache.clear(); }
+
+function readPackage(dir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+    if (!pkg || typeof pkg !== 'object') return null;
+    return {
+      name: typeof pkg.name === 'string' && pkg.name ? pkg.name : null,
+      version: typeof pkg.version === 'string' && pkg.version ? pkg.version : null,
+    };
+  } catch {
+    return null;   // not an npm project / unreadable — fields stay null
+  }
+}
+
+// Numeric 3-part compare (same policy as klypix-format's ship observer, which
+// keeps its copy module-private). Prerelease suffixes are deliberately NOT
+// ordered here — callers compare exact strings first, so "1.2.3-beta" vs
+// "1.2.3" lands in the ahead branch rather than pretending alignment.
+// Exported (1.70.0): the release-lease advisory in mcp-presence compares the
+// checkout's packageVersion against latestReleaseTag with the same policy.
+export const cmpSemver3 = (a, b) => {
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+  return 0;
+};
+
+// A version counts as released when a tag names it: v<version> or <version>
+// (the spec forms), plus the changesets/lerna "<name>@<version>" convention
+// this package's own SAFE_TAG_RE already acknowledges.
+const releaseTagNames = (name, version) => {
+  const names = [`v${version}`, String(version)];
+  if (name) names.push(`${name}@${version}`);
+  return names;
+};
+
+// One repo's release-critical state. Returns null when the directory yields no
+// git identity at all (not a repo / git missing) — the caller omits it.
+function repoStateForDir(git, dir) {
+  const branchRaw = git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (branchRaw === null) return null;
+  const branch = branchRaw && branchRaw !== 'HEAD' ? branchRaw : null;   // null = detached
+  const headShort = git(dir, ['rev-parse', '--short', 'HEAD']) || null;
+  const pkg = readPackage(dir);
+  const tagsRaw = git(dir, ['tag', '--points-at', 'HEAD']);
+  const allTagsAtHead = tagsRaw
+    ? tagsRaw.split('\n').map((t) => t.trim()).filter(Boolean)
+    : [];
+  // The response payload is capped, but the RELEASE verdict must scan the full
+  // list: `git tag --points-at` emits lexicographically, so eight junk tags
+  // sorting before v<version> would otherwise flip a genuinely released HEAD
+  // to "untagged" — and the installer's released-tag guard refuses on that.
+  const tagsAtHead = allTagsAtHead.slice(0, MAX_TAGS_AT_HEAD);
+  const isReleaseTag = Boolean(pkg?.version
+    && allTagsAtHead.some((tag) => releaseTagNames(pkg.name, pkg.version).includes(tag)));
+  // OFFLINE ahead/behind: the local tracking ref only. Counts can be stale
+  // relative to the real remote — that is the honest offline answer, and a
+  // stale count still exposes "this checkout diverged from what it tracks".
+  let aheadBehindOrigin = null;
+  const upstream = git(dir, ['rev-parse', '--abbrev-ref', '@{upstream}']);
+  if (upstream) {
+    const counts = git(dir, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`]);
+    const match = counts ? counts.match(/^(\d+)\s+(\d+)$/) : null;
+    if (match) {
+      aheadBehindOrigin = { upstream, ahead: Number(match[1]), behind: Number(match[2]) };
+    }
+  }
+  return {
+    branch,
+    headShort,
+    packageVersion: pkg?.version || null,
+    tagsAtHead,
+    isReleaseTag,
+    aheadBehindOrigin,
+  };
+}
+
+// Trunk candidates, most-authoritative first. The remote tracking ref beats a
+// local branch: a local `master` can itself be stale, and the question a
+// release must answer is "does this carry everything the TEAM has landed".
+const TRUNK_REFS = ['origin/master', 'origin/main', 'master', 'main'];
+const MAX_MISSING_LISTED = 8;
+// git cherry has no --max-count, so a pathological divergence is bounded here
+// rather than parsed forever.
+const MAX_CHERRY_SCAN = 500;
+// Measured 670ms on a real 200-commit divergence; the shared 1500ms budget was
+// already failing intermittently and reporting the release as clean.
+const CHERRY_TIMEOUT_MS = 10_000;
+const UNIT_SEP = '';
+
+/**
+ * Would this release leave finished work behind?
+ *
+ * The recorded rule is "never ship a build that is not a descendant of trunk —
+ * the check is ANCESTRY, not version number", and it exists because desktop
+ * 1.3.107 was the highest version number KLYPIX had ever produced while missing
+ * 211 trunk commits and an entire feature. A higher number on an off-trunk
+ * branch is perfect camouflage.
+ *
+ * Until now that rule lived only as a card — recall, which works exactly as
+ * often as somebody exercises it. On 2026-08-15 nobody did: three finished
+ * commits sat on master while a release was cut from a branch that could never
+ * contain them, and the FOUNDER caught it, not the tooling. Coordination in
+ * this engine has always been about files two sessions are editing RIGHT NOW;
+ * nothing ever asked whether finished work was actually IN the build. This is
+ * that missing axis.
+ *
+ * Advisory data, never a refusal — a hotfix cut from a tag is a legitimate
+ * off-trunk release. The caller decides; this only makes it impossible to be
+ * unaware.
+ *
+ * @returns {null|{trunk, ref, isDescendant, missingCount, missing:Array<{sha,subject}>}}
+ *   null when the question cannot be answered (no git, no trunk, unknown ref).
+ */
+/**
+ * Which files each commit touched — one bounded batch call.
+ *
+ * This exists to JOIN the leave-behind set to the presence table. The engine
+ * has always modelled "which files are two sessions editing right now" and,
+ * separately, "what would this release drop", and never connected them. So a
+ * dropped commit arrived as an anonymous sha even when the session that wrote
+ * it was live in the same lane, had declared the exact files, and had told the
+ * human its work would be in the build. Field case: desktop v1.3.120.
+ *
+ * Merge commits legitimately yield no names under `--name-only`; feature work
+ * is what this join is for, so that is acceptable rather than worked around.
+ */
+export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeoutMs = 4000, max = 40 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const list = [...new Set((shas || []).map((s) => String(s || '').trim()).filter(Boolean))].slice(0, max);
+  const out = new Map();
+  if (!dir || !list.length) return out;
+  // An explicit  sentinel before each sha, so blocks parse unambiguously.
+  // File paths may contain almost anything; a control char cannot appear in one.
+  const SENTINEL = '';
+  // `core.quotepath=false` because git otherwise C-quotes non-ASCII paths
+  // ("\330\247..."), which normalizeFileKey can never match against a declared
+  // Arabic filename — attribution went silently blind for AR users (review
+  // catch, verified live). The subject rides the header line behind a unit
+  // separator so a commit promoted into the display from beyond the prose
+  // list still has a human-readable name.
+  const raw = git(dir, ['-c', 'core.quotepath=false', 'show', '--name-only', `--format=${SENTINEL}%H${UNIT_SEP}%s`, ...list], timeoutMs);
+  if (raw === null) return out;                       // probe failed: no owners, never a wrong owner
+  for (const block of String(raw).split(SENTINEL)) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    const sep = lines[0].indexOf(UNIT_SEP);
+    const sha = sep < 0 ? lines[0] : lines[0].slice(0, sep);
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    out.set(sha.toLowerCase(), {
+      files: lines.slice(1),
+      subject: sep < 0 ? '' : lines[0].slice(sep + 1).slice(0, 120),
+    });
+  }
+  return out;
+}
+
+/**
+ * The commits a release ref carries since the last one — subject AND body.
+ *
+ * The release-cut reconcile advisory (1.85.0) asks "does anything still OPEN in
+ * the brain look like it already shipped in this build?", and the only evidence
+ * a cut has is its own commits. `commitFiles` above answers "which files", which
+ * is the wrong axis: a card is closed by what a commit SAID, not what it
+ * touched. The body matters as much as the subject — a 5-token subject almost
+ * never covers a card's claim, and `commitToCard` has always required a ≥12-char
+ * body before a commit is worth carding at all.
+ *
+ * Bounded twice over (500 commits, 4 s) because this runs inside a brain_sync
+ * that must never become slow, and `capped` is REPORTED rather than hidden: a
+ * truncated scan that reads as a complete one would let "nothing looks done"
+ * mean two different things.
+ *
+ * @returns {{commits: Array<{sha, subject, body, ts}>, capped: boolean,
+ *            status: 'ok'|'unknown', reason?: string}}
+ */
+export function commitsInRange(projectDir, sinceRef, ref, { execGit = defaultExecGit, timeoutMs = 4000, max = 500 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const target = String(ref || '').trim();
+  const since = String(sinceRef || '').trim();
+  if (!dir || !target) return { commits: [], capped: false, status: 'unknown', reason: 'no-ref' };
+  const REC = '\x1e', UNIT = '\x1f';
+  // `sinceRef..ref` when a baseline exists, else just the ref's own tip window.
+  // A bad/unknown sinceRef makes git exit non-zero — that is reported, never
+  // silently retried against the whole history (a 50k-commit scan inside a sync).
+  const range = since ? `${since}..${target}` : target;
+  const raw = git(dir, ['log', '--no-merges', `--max-count=${max + 1}`, `--format=${REC}%H${UNIT}%s${UNIT}%b${UNIT}%ct`, range], timeoutMs);
+  if (raw === null) return { commits: [], capped: false, status: 'unknown', reason: since ? 'bad-range' : 'bad-ref' };
+  const all = [];
+  for (const rec of String(raw).split(REC)) {
+    if (!rec.trim()) continue;
+    const p = rec.split(UNIT);
+    const sha = String(p[0] || '').trim();
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    const ts = Number(String(p[3] || '').trim());
+    all.push({
+      sha: sha.toLowerCase(),
+      subject: String(p[1] || '').trim().slice(0, 200),
+      body: String(p[2] || '').trim().slice(0, 2000),
+      ts: Number.isFinite(ts) ? ts : 0,
+    });
+  }
+  const capped = all.length > max;
+  return { commits: capped ? all.slice(0, max) : all, capped, status: 'ok' };
+}
+
+/**
+ * "Is this sha in that ref?" — the one containment question, asked at most
+ * `maxChecks` times per probe and cached per sha.
+ *
+ * Built on `settleClaimsAgainstRef` rather than beside it so there is exactly
+ * one place in this package that decides what `contained` means. Anything the
+ * budget could not reach answers FALSE: a capped probe must never be read as
+ * evidence that work shipped.
+ */
+export function makeContainmentProbe(projectDir, ref, { execGit = defaultExecGit, maxChecks = 64 } = {}) {
+  const cache = new Map();
+  let checks = 0;
+  return (sha) => {
+    const s = String(sha || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{7,40}$/.test(s)) return false;
+    if (cache.has(s)) return cache.get(s);
+    if (checks >= maxChecks) return false;
+    checks++;
+    const [settled] = settleClaimsAgainstRef(projectDir, ref, [{ shas: [s] }], { execGit, maxChecks: 1 });
+    const contained = !!(settled && settled.contained);
+    cache.set(s, contained);
+    return contained;
+  };
+}
+
+// ── Committed claims — the promise that travels with the repository ─────────
+//
+// A lane claim protects a machine; a COMMITTED claim protects a team. The file
+// lives at .klypix/claims/<owner>.json, rides ordinary git push/pull, is
+// reviewable in a PR and auditable in history — so the release gate on ANY
+// clone reads promises made on any other machine, with zero infrastructure
+// beyond the version control the team already has. One file per owner keeps
+// merges trivial: two teammates staking concurrently touch different paths.
+export const COMMITTED_CLAIMS_DIR = path.join('.klypix', 'claims');
+const COMMITTED_CLAIMS_MAX_FILES = 64;
+const COMMITTED_CLAIM_MAX_BYTES = 8 * 1024;
+
+const committedClaimFileName = (ownerId) => {
+  const slug = String(ownerId || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'owner';
+  const hash = crypto.createHash('sha1').update(String(ownerId || '')).digest('hex').slice(0, 12);
+  return `${slug}-${hash}.json`;
+};
+
+function normalizeCommittedClaim(raw, file, now) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { problem: 'not an object' };
+  if (raw.schemaVersion !== 1) return { problem: `unknown schemaVersion ${raw.schemaVersion}` };
+  const owner = raw.owner && typeof raw.owner === 'object' ? raw.owner : {};
+  const ownerId = String(owner.id || '').trim().slice(0, 160);
+  const shas = [...new Set((Array.isArray(raw.shas) ? raw.shas : [])
+    .map((s) => String(s || '').trim().toLowerCase())
+    .filter((s) => /^[0-9a-f]{4,40}$/.test(s)))].slice(0, 20);
+  const stakedAt = Number(raw.stakedAt || 0);
+  const expiresAt = Number(raw.expiresAt || 0);
+  if (!ownerId) return { problem: 'missing owner.id' };
+  if (!shas.length) return { problem: 'no valid shas' };
+  if (!stakedAt || !expiresAt) return { problem: 'missing stakedAt/expiresAt' };
+  if (now >= expiresAt) return { expired: true };
+  return {
+    claim: {
+      ownerId,
+      ownerClient: String(owner.client || 'unknown').slice(0, 40),
+      ownerLogicalId: String(owner.logicalId || '').trim().slice(0, 160) || null,
+      branch: String(raw.branch || '').slice(0, 120) || null,
+      note: String(raw.note || '').replace(/\s+/g, ' ').trim().slice(0, 160) || null,
+      shas,
+      stakedAt,
+      expiresAt,
+      committed: { file },
+    },
+  };
+}
+
+/**
+ * Read every committed claim in the working tree. Bounded, schema-validated,
+ * and LOUD about what it skipped: `problems` names each malformed file, and
+ * `truncated` says the directory exceeded the scan cap — a gate input that
+ * silently drops entries is the recurring defect this module exists to end.
+ */
+export function readCommittedClaims(projectDir, { now = Date.now() } = {}) {
+  const dir = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR);
+  const out = { claims: [], problems: [], truncated: false };
+  let names;
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort(); }
+  catch { return out; }                       // no directory = no committed claims
+  if (names.length > COMMITTED_CLAIMS_MAX_FILES) {
+    out.truncated = true;
+    names = names.slice(0, COMMITTED_CLAIMS_MAX_FILES);
+  }
+  for (const name of names) {
+    const rel = path.join(COMMITTED_CLAIMS_DIR, name);
+    try {
+      const stat = fs.statSync(path.join(dir, name));
+      if (stat.size > COMMITTED_CLAIM_MAX_BYTES) { out.problems.push({ file: rel, problem: `over ${COMMITTED_CLAIM_MAX_BYTES} bytes` }); continue; }
+      const parsed = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      const result = normalizeCommittedClaim(parsed, rel, now);
+      if (result.claim) out.claims.push(result.claim);
+      else if (!result.expired) out.problems.push({ file: rel, problem: result.problem });
+    } catch (err) {
+      out.problems.push({ file: rel, problem: `unreadable: ${String(err?.message || err).slice(0, 80)}` });
+    }
+  }
+  return out;
+}
+
+/**
+ * Write (or overwrite) the caller's own committed claim. Atomic tmp+rename;
+ * the filename derives from the owner id, so a session can only ever occupy
+ * its own slot and a re-stake replaces rather than accumulates.
+ */
+export function writeCommittedClaim(projectDir, claim) {
+  const dir = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const name = committedClaimFileName(claim.ownerId);
+  const file = path.join(dir, name);
+  const payload = JSON.stringify({
+    schemaVersion: 1,
+    owner: { id: claim.ownerId, client: claim.ownerClient, ...(claim.ownerLogicalId ? { logicalId: claim.ownerLogicalId } : {}) },
+    shas: claim.shas,
+    ...(claim.branch ? { branch: claim.branch } : {}),
+    ...(claim.note ? { note: claim.note } : {}),
+    stakedAt: claim.stakedAt,
+    expiresAt: claim.expiresAt,
+  }, null, 2) + '\n';
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, payload, 'utf8');
+  fs.renameSync(tmp, file);
+  return { file, relPath: path.join(COMMITTED_CLAIMS_DIR, name).replace(/\\/g, '/') };
+}
+
+/** Delete the caller's own committed claim slot. Returns the relPath it removed, or null. */
+export function deleteCommittedClaim(projectDir, ownerId) {
+  const name = committedClaimFileName(ownerId);
+  const file = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR, name);
+  try { fs.unlinkSync(file); } catch { return null; }
+  return { relPath: path.join(COMMITTED_CLAIMS_DIR, name).replace(/\\/g, '/') };
+}
+
+/**
+ * Settle staked release claims against the release ref.
+ *
+ * A claim is the durable half of "you'll see it in the next build": shas an
+ * owner promised would ride the next release, surviving the owner's session.
+ * Ancestry compares trunk and LIVE peer branches; a claim covers exactly the
+ * hole that leaves — a commit on a branch nobody is on any more.
+ *
+ * Per sha, three honest outcomes: contained in the ref, MISSING from it, or
+ * UNRESOLVABLE (the sha is gone — rebase/squash rewrote it, or the branch was
+ * deleted). Unresolvable is reported as its own state, never silently treated
+ * as contained (that would let history rewriting clear a claim) and never as
+ * missing (the remedy differs: the owner must re-stake the rewritten shas).
+ *
+ * Bounded: at most `maxChecks` unique shas are probed; anything beyond is
+ * marked unverified and SAID so — a capped check must never read as a full one.
+ */
+export function settleClaimsAgainstRef(projectDir, ref, claims, { execGit = defaultExecGit, maxChecks = 64 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const target = String(ref || '').trim();
+  const list = Array.isArray(claims) ? claims : [];
+  if (!dir || !target || !list.length) return [];
+  const verdictCache = new Map();   // sha -> 'contained' | 'missing' | 'unresolvable' | 'unverified'
+  let checks = 0;
+  const verdictFor = (sha) => {
+    if (verdictCache.has(sha)) return verdictCache.get(sha);
+    let verdict;
+    if (checks >= maxChecks) {
+      verdict = 'unverified';
+    } else {
+      checks++;
+      if (git(dir, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]) === null) {
+        verdict = 'unresolvable';
+      } else {
+        // makeGit maps a non-zero exit to null, so "not an ancestor" and a
+        // failed spawn look identical here — both must BLOCK (missing), never
+        // pass: over-reporting is a conversation, under-reporting ships a
+        // build without the claimed work.
+        verdict = git(dir, ['merge-base', '--is-ancestor', sha, target]) === null ? 'missing' : 'contained';
+      }
+    }
+    verdictCache.set(sha, verdict);
+    return verdict;
+  };
+  return list.map((claim) => {
+    const missing = [];
+    const unresolvable = [];
+    const unverified = [];
+    for (const sha of claim.shas || []) {
+      const verdict = verdictFor(String(sha).toLowerCase());
+      if (verdict === 'missing') missing.push(sha);
+      else if (verdict === 'unresolvable') unresolvable.push(sha);
+      else if (verdict === 'unverified') unverified.push(sha);
+    }
+    return {
+      claim,
+      missing,
+      unresolvable,
+      unverified,
+      contained: !missing.length && !unresolvable.length && !unverified.length,
+    };
+  });
+}
+
+export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, peerBranches = [] } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  if (!dir) return { status: 'unknown', reason: 'no-project-dir', isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  const target = String(ref || '').trim() || 'HEAD';
+  const shaOf = (r) => git(dir, ['rev-parse', '--verify', `${r}^{commit}`]);
+  const resolves = (r) => shaOf(r) !== null;
+  // A gate that cannot run must SAY SO. Returning null here made "the ref does
+  // not exist" and "git timed out" indistinguishable from "clean" — and the
+  // caller granted the lease silently, which an agent could trigger with a
+  // single mistyped ref name. Unknown is now its own state, and the gateway
+  // treats it as blocking.
+  if (git(dir, ['rev-parse', '--git-dir']) === null) {
+    return { status: 'unknown', reason: 'git-unavailable', ref: target, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
+  const targetSha = shaOf(target);
+  if (targetSha === null) {
+    return { status: 'unknown', reason: 'target-unresolved', ref: target, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
+
+  // ALL trunk candidates, not the first that resolves. First-match-wins picked
+  // origin/master in every normal clone and therefore NEVER compared LOCAL
+  // master — which is exactly where the 2026-08-15 commits sat, unpushed. The
+  // feature was blind to its own motivating incident for any session without a
+  // live peer on that branch. Local trunk ahead of a release ref is precise,
+  // not heuristic, so this adds no squash-merge noise beyond what origin/master
+  // already carries. `origin/HEAD` is probed too, so a repo whose trunk is
+  // `develop` or `trunk` is not left with no gate at all.
+  const trunkRefs = TRUNK_REFS.filter(resolves);
+  const originHead = git(dir, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  if (originHead && !trunkRefs.includes(originHead) && resolves(originHead)) trunkRefs.push(originHead);
+  const trunk = trunkRefs[0] || null;
+
+  // WHY PEER BRANCHES, and not trunk alone — learned the hard way on
+  // 2026-08-15. The trunk check alone said release/1.3.113 was fine: it IS a
+  // descendant of origin/master. But origin/master was 214 commits behind the
+  // LOCAL master where the finished work actually sat, unpushed. Trunk ancestry
+  // catches the 1.3.107 class (a branch forked off trunk long ago); it cannot
+  // catch work that has not reached trunk yet.
+  //
+  // The presence lane is the only thing that knows which branches are live,
+  // which is precisely why this belongs in the coordination engine and not in
+  // one repo's prebuild script. A prebuild gate can only see refs; the lane
+  // sees WHO IS WORKING WHERE.
+  const seen = new Set();
+  const candidates = [];
+  const trunkSet = new Set(trunkRefs);
+  for (const r of [...trunkRefs, ...peerBranches]) {
+    const name = String(r || '').trim();
+    if (!name || name === target || seen.has(name)) continue;
+    // Unresolvable refs are dropped; SAME-SHA refs are deliberately kept. A
+    // release branch cut from trunk and declared immediately is the single most
+    // common legitimate case, and dropping the equal ref left zero candidates —
+    // which the new "cannot answer" path then refused. Kept, the ancestry check
+    // finds it is trivially an ancestor, contributes no source, and the release
+    // reads clean, which is the truth.
+    if (shaOf(name) === null) continue;
+    seen.add(name);
+    candidates.push({ ref: name, kind: trunkSet.has(name) ? 'trunk' : 'peer-branch' });
+  }
+
+  // NO third source, deliberately — and this is a decision, not an omission.
+  // A scan of recently-committed local branches was built and MEASURED against
+  // this repo: it produced 30-62 "missing" commits across 6-14 branches, most of
+  // them work already squash-merged into trunk under different SHAs. Ancestry
+  // cannot see through a squash, so the heuristic manufactures false positives
+  // at exactly the moment someone is trying to ship — and this project has the
+  // scar for that: five consecutive releases reported red over perfect publishes,
+  // and the recorded lesson is that alarm fatigue is itself a release-integrity
+  // defect. Trunk and live-peer branches are both PRECISE (no false positives by
+  // construction), so the gate keeps only those. The cost is stated honestly in
+  // the doc comment above rather than papered over with a noisy proxy.
+
+  if (!candidates.length) {
+    return { status: 'unknown', reason: 'no-comparable-refs', ref: target, trunk, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
+
+  const sources = [];
+  const claimed = new Set();   // shas already attributed to an earlier source
+  for (const cand of candidates) {
+    // `merge-base --is-ancestor` exits 0/1, and makeGit turns a non-zero exit
+    // into null — so null here means "not an ancestor", not "unknown".
+    if (git(dir, ['merge-base', '--is-ancestor', cand.ref, target]) !== null) continue;
+    // `git cherry` INSTEAD OF `rev-list`, and this is the single most important
+    // line in the module. rev-list compares SHAS, so it reported as "missing"
+    // every commit that had been rebased, cherry-picked, or squash-merged into
+    // the target under a new sha — measured on the real repo, that was 30-62
+    // false positives across 6-14 branches, and it forced an otherwise-good
+    // source to be deleted rather than tuned.
+    //
+    // `git cherry <target> <source>` compares PATCH-IDs: `+` means the change
+    // genuinely is not there, `-` means an equivalent change already is.
+    // Verified on real repos: it sees through a rebase, a cherry-pick, and a
+    // single-commit squash. It does NOT see through a squash of several commits
+    // into one (the combined diff cannot match any individual patch-id) — an
+    // honest, documented residue rather than a silent one.
+    //
+    // It also fixes the merge over-count for free: where rev-list said 2 for a
+    // divergence carrying one real change plus its merge commit, cherry says 1.
+    // Count and listing now come from the SAME source, so they can no longer
+    // disagree in the caller's favour — which is what let a merge-only
+    // divergence satisfy the handshake with an empty list.
+    //
+    // TIMEOUT DISCIPLINE, learned the hard way one commit before this shipped:
+    // patch-id computation is far slower than the rev-parse probes this module
+    // was built around, and at the shared 1500ms budget `git cherry` returned
+    // null on the real repo — which the loop read as "nothing missing" and the
+    // gate reported the release as CLEAN. A false negative here is strictly
+    // worse than every false positive this module has ever produced, so cherry
+    // gets its own budget AND a failure is never allowed to mean "clean".
+    const cherry = git(dir, ['cherry', target, cand.ref], CHERRY_TIMEOUT_MS);
+    let count;
+    let shown;
+    // Every sha this source drops, not just the ones the prose will name. The
+    // acknowledgement handshake reads this; the prose reads `shown`.
+    let allMissingShas = [];
+    let approximate = false;
+    if (cherry !== null) {
+      const allCherry = cherry.split('\n')
+        .filter((l) => l.startsWith('+ '))
+        .map((l) => l.slice(2).trim())
+        .filter(Boolean);
+      // TAIL, not head. `git cherry` emits OLDEST first, so a head slice on a
+      // >500-commit divergence dropped the NEWEST commits from both the display
+      // AND the acknowledgement — the exact failure class the newest-first fix
+      // exists to prevent, reintroduced one level up (2026-08-17 review catch).
+      // The tail keeps the newest; `count` stays the TRUE total so missingCount
+      // never understates; `scanCapped` lets the warning text admit the cap.
+      const missingShas = allCherry.slice(-MAX_CHERRY_SCAN);
+      count = allCherry.length;
+      if (count <= 0) continue;              // every change is already present
+      // NEWEST FIRST, and this is the whole point of the list. `git cherry` emits
+      // OLDEST first, so slicing it raw showed the eight most ANCIENT missing
+      // commits while hiding everything recent — and the fallback branch below,
+      // which uses `git log`, showed the eight NEWEST. The two paths disagreed,
+      // and the PRECISE one was the worse of the two.
+      //
+      // Field case 2026-08-16, desktop v1.3.120: the gate refused correctly and
+      // named 69 commits missing from master, but the eight it SHOWED were weeks
+      // old. The three the human was actually waiting for — an Arrow tool and a
+      // zoom-relative stroke-width pair committed 28 minutes earlier, which a peer
+      // session had already promised would "ride the next build" — sat at the end
+      // of the list and were never displayed. The human approved a narrow build on
+      // an accurate refusal whose visible evidence omitted the deciding facts.
+      // A truncated list is a RANKING problem: show what someone is most likely to
+      // be waiting for, which is always the most recent work.
+      allMissingShas = missingShas.reverse();          // newest first
+      shown = allMissingShas.slice(0, MAX_MISSING_LISTED);
+    } else {
+      // FALL BACK, never skip. rev-list is sha-based so it over-reports
+      // rebases and squashes, but over-reporting is a conversation and
+      // under-reporting is a lost feature. The source is marked approximate so
+      // the text can say the equivalence check could not run.
+      const countRaw = git(dir, ['rev-list', '--count', `${target}..${cand.ref}`]);
+      count = Number(countRaw);
+      if (!Number.isFinite(count) || count <= 0) continue;
+      approximate = true;
+      // Fetch the full bounded set, not just what will be shown: the gate needs
+      // every sha even on the approximate path, and `git log` is already
+      // newest-first so both branches now agree on ordering AND on completeness.
+      const fallbackLog = git(dir, ['log', `--max-count=${MAX_CHERRY_SCAN}`, '--format=%H', `${target}..${cand.ref}`]);
+      allMissingShas = (fallbackLog || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      shown = allMissingShas.slice(0, MAX_MISSING_LISTED);
+    }
+    if (!shown.length) continue;
+    // One bounded call for the subjects of just what will be shown.
+    const log = git(dir, ['log', '--no-walk', `--format=%h%x1f%s`, ...shown]);
+    let parsed = (log || '').split('\n').filter(Boolean).map((line) => {
+      const sep = line.indexOf(UNIT_SEP);
+      return sep < 0
+        ? { sha: line.trim(), subject: '' }
+        : { sha: line.slice(0, sep).trim(), subject: line.slice(sep + 1).slice(0, 120) };
+    });
+    // A failed SUBJECT probe must not erase the shas (2026-08-17 review catch).
+    // When this log call times out while cherry succeeded, `parsed` was empty,
+    // `missing` was empty, and the whole ancestry degraded to 'unnameable' —
+    // whose refusal then listed acknowledgeRequired from allShas while the gate
+    // unconditionally refused 'unnameable': an instruction that can never
+    // succeed. Shas without subjects are still NAMEABLE; render them bare.
+    if (!parsed.length && shown.length) {
+      parsed = shown.map((sha) => ({ sha: String(sha).slice(0, 9), subject: '' }));
+    }
+    // Trunk and a peer sitting on trunk are the DEFAULT configuration, so the
+    // same commits would otherwise be counted twice and demanded twice. Each
+    // sha is attributed to the first source that reports it.
+    const missing = parsed.filter((c) => c.sha && !claimed.has(c.sha));
+    for (const c of missing) claimed.add(c.sha);
+    if (!missing.length && count > 0 && parsed.length) continue;   // wholly duplicated source
+    // `approximate` = the patch-id equivalence check could not run for this
+    // source, so the list may include work that is already present under a
+    // different sha. Carried on the source so the text can say so rather than
+    // asserting a precision it does not have.
+    // DISPLAY IS BOUNDED; THE GATE MUST NOT BE. `missing` is the 8 commits the
+    // prose will name. `allShas` is every sha this source drops, and it is what
+    // the acknowledgement handshake has to demand.
+    //
+    // Field case 2026-08-16, desktop v1.3.120: ancestryAcknowledged() derived its
+    // requirement from `missing` — the DISPLAY list — so a release dropping 71
+    // commits was cleared by naming 10. The design's whole contract is that a
+    // lease "cannot be taken without REPRODUCING the shas it is choosing to
+    // leave behind", on the reasoning that a model forced to reproduce them has
+    // in practice had to relay them. Deriving the requirement from a truncated
+    // list quietly reduced that contract to whatever happened to fit on screen.
+    // A truncated requirement is a truncated guarantee.
+    const allShas = (allMissingShas.length ? allMissingShas : parsed.map((c) => c.sha))
+      .map((s) => String(s || '').toLowerCase())
+      .filter(Boolean);
+    sources.push({
+      ...cand,
+      missingCount: count,
+      missing,
+      allShas,
+      // True when the prose cannot name everything this source drops, so the
+      // caller can say "8 of 71 shown" instead of implying the list is complete.
+      listTruncated: allShas.length > missing.length,
+      // True when even allShas is a cap (divergence beyond MAX_CHERRY_SCAN):
+      // the acknowledgement then covers the newest 500 but NOT everything, and
+      // the warning text must say so rather than let a capped ack read as full.
+      ...(count > allShas.length ? { scanCapped: true } : {}),
+      ...(approximate ? { approximate: true } : {}),
+    });
+  }
+
+  if (!sources.length) {
+    return { status: 'ok', trunk, ref: target, isDescendant: true, missingCount: 0, sources: [], missing: [] };
+  }
+  const missingCount = sources.reduce((n, s) => n + s.missingCount, 0);
+  const listed = sources.flatMap((s) => s.missing);
+  return {
+    // A divergence we can count but cannot NAME is still a refusal — the caller
+    // must not be able to acknowledge an empty list.
+    status: listed.length ? 'dirty' : 'unnameable',
+    trunk,
+    ref: target,
+    isDescendant: false,
+    missingCount,
+    sources,
+    // Flattened for the common case of one diverged source.
+    missing: listed.slice(0, MAX_MISSING_LISTED),
+  };
+}
+
+/**
+ * The half that actually matters: lines a HUMAN reads.
+ *
+ * Founder's correction, verbatim — "at least the user should be
+ * informed/asked about it". A structured field only a model consumes is not a
+ * gate, because a model can decline to mention it. These strings ride the
+ * release-lease response at blocking severity, so a session cannot take the
+ * lease and stay quiet about what the release would drop.
+ */
+export function releaseAncestryWarnings(ancestry) {
+  if (!ancestry || ancestry.isDescendant) return [];
+
+  // A gate that could not run is a finding, not a pass. Silence here was how a
+  // mistyped ref, a missing git, or a 1.5s timeout turned the whole check off
+  // while looking exactly like a clean release.
+  if (ancestry.status === 'unknown') {
+    const why = {
+      'git-unavailable': 'git could not be read in this project',
+      'target-unresolved': `the ref "${ancestry.ref}" does not exist here`,
+      'no-comparable-refs': 'there is no trunk or peer branch to compare against',
+      'no-project-dir': 'no project directory was supplied',
+    }[ancestry.reason] || ancestry.reason || 'the check could not run';
+    return [
+      `RELEASE CHECK COULD NOT RUN — ${why}.`,
+      'This is not an all-clear: nothing was verified about what this release would leave out.',
+      'Tell the user, and check by hand that the release branch contains everything it should.',
+    ];
+  }
+
+  const { ref, missingCount, sources } = ancestry;
+  const named = sources.flatMap((s) => s.missing).length;
+  const lines = [
+    `RELEASE WOULD LEAVE WORK BEHIND — ${missingCount} finished commit(s) already exist that this release does not include.`,
+  ];
+  // The join to the presence table, stated first because it is the fact most
+  // likely to change the decision: some of this work belongs to somebody who is
+  // online now and may have already promised it would ship.
+  if (ancestry.peerOwnedCount) {
+    lines.push(`  ${ancestry.peerOwnedCount} of them touch files a LIVE session has declared or is editing — that session may have already told the user this work would be in the build. Name them to the user, and consider asking those sessions before you acknowledge.`);
+  }
+  for (const s of sources) {
+    lines.push(s.kind === 'trunk'
+      ? `  ${s.missingCount} commit(s) on ${s.ref} (the main line) are not in ${ref}:`
+      : `  ${s.missingCount} commit(s) on ${s.ref} — a branch someone is working on right now — are not in ${ref}:`);
+    for (const c of s.missing) {
+      // A sha with a live owner attached is a different conversation from an
+      // anonymous one: it names a person who is online RIGHT NOW and who very
+      // likely believes this work is in the build. Say so on the same line.
+      const owners = (Array.isArray(c.owners) ? c.owners : []).filter((o) => !o.sharedScopeOnly);
+      const who = owners.length
+        ? `  ← OWNED BY LIVE SESSION ${owners.map((o) => o.prefix).join(', ')} (${owners[0].files.slice(0, 2).join(', ')})`
+        : '';
+      lines.push(`    · ${c.sha} ${c.subject}${who}`);
+    }
+    if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more not listed`);
+    if (s.scanCapped) {
+      lines.push(`    (divergence exceeds the ${Array.isArray(s.allShas) ? s.allShas.length : 500}-commit scan cap — the acknowledgement below covers only the newest ${Array.isArray(s.allShas) ? s.allShas.length : 500};`);
+      lines.push('     a divergence this size should be RESOLVED, not acknowledged)');
+    }
+    if (s.approximate) {
+      lines.push('    (this list is approximate — the equivalence check could not run, so some of');
+      lines.push('     these may already be in the release under a different commit id)');
+    }
+  }
+  if (!named) {
+    lines.push('  (none of them could be listed individually — they are merge commits; inspect the range by hand)');
+  }
+  lines.push('');
+  lines.push('WHAT THIS MEANS FOR THE USER: if this release is built now, that work will not be in it,');
+  lines.push('and nobody will notice until someone looks for a feature that is missing.');
+  lines.push('Say this to them in your own words, listing what is above, BEFORE going any further.');
+  return lines;
+}
+
+// Released means "a tag anywhere in the repo names this version" — not only at
+// HEAD, because a checkout routinely moves past the commit it tagged while the
+// version itself stays published.
+function versionReleased(git, dir, name, version) {
+  const out = git(dir, ['tag', '--list', ...releaseTagNames(name, version)]);
+  return out === null ? null : out.length > 0;
+}
+
+// The HIGHEST release-shaped tag anywhere in the repo (v1.2.3 / 1.2.3 /
+// <name>@1.2.3) → { tag, version } or null. This is the "last released"
+// baseline the zero-config release advisory compares packageVersion against:
+// a checkout sitting at a HIGHER version than any release tag is release
+// preparation in progress, whether or not anyone declared it. One bounded
+// spawn; a junk-tag flood is capped rather than scanned forever.
+const MAX_TAG_SCAN = 2000;
+function latestReleaseTag(git, dir, name) {
+  const out = git(dir, ['tag', '--list']);
+  if (!out) return null;
+  let best = null;
+  for (const line of out.split('\n').slice(0, MAX_TAG_SCAN)) {
+    const tag = line.trim();
+    if (!tag) continue;
+    let version = null;
+    const plain = /^v?(\d+\.\d+\.\d+)$/.exec(tag);
+    if (plain) version = plain[1];
+    else if (name && tag.startsWith(`${name}@`)) {
+      const candidate = tag.slice(name.length + 1);
+      if (/^\d+\.\d+\.\d+$/.test(candidate)) version = candidate;
+    }
+    if (!version) continue;
+    if (!best || cmpSemver3(version, best.version) > 0) best = { tag, version };
+  }
+  return best;
+}
+
+// Zero-config bundled-mirror detection — the exact incident geometry:
+// <projectRoot>/packages/<dirname>/package.json (the bundled mirror) paired by
+// PACKAGE NAME with <projectRoot>/../<dirname>/ (the source checkout the
+// bundle-sync would copy from). Read-only outside the project root: one
+// package.json read plus the same bounded git probes as the root repo.
+function detectSiblings(git, projectDir) {
+  const siblings = [];
+  const packagesDir = path.join(projectDir, 'packages');
+  let entries = [];
+  try {
+    entries = fs.readdirSync(packagesDir, { withFileTypes: true });
+  } catch {
+    return siblings;   // no packages/ dir — the common case, one cheap readdir
+  }
+  const parent = path.dirname(projectDir);
+  let scanned = 0;
+  for (const entry of entries) {
+    if (siblings.length >= MAX_SIBLINGS || scanned >= MAX_PACKAGE_ENTRIES) break;
+    if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+    scanned += 1;
+    const mirror = readPackage(path.join(packagesDir, entry.name));
+    if (!mirror?.name || !mirror.version) continue;
+    const siblingDir = path.join(parent, entry.name);
+    const siblingPkg = readPackage(siblingDir);
+    // Same package name is the pairing proof — a coincidentally-named folder
+    // next door must not generate drift verdicts about an unrelated project.
+    if (!siblingPkg?.name || siblingPkg.name !== mirror.name) continue;
+    const state = repoStateForDir(git, siblingDir);
+    if (!state || !state.packageVersion) continue;   // no git identity → no verdict
+    let drift;
+    if (state.packageVersion === mirror.version) {
+      drift = 'aligned';
+    } else if (cmpSemver3(state.packageVersion, mirror.version) < 0) {
+      drift = 'mirror-ahead';
+    } else {
+      // Ahead (or an equal-numeric prerelease difference). Whether the
+      // sibling's version is PUBLISHED is the incident's hinge: a tag lookup
+      // failure reads as untagged on purpose — when release state cannot be
+      // confirmed, the safe verdict is the one that warns.
+      const released = versionReleased(git, siblingDir, siblingPkg.name, state.packageVersion);
+      drift = released === true ? 'sibling-ahead-released' : 'sibling-ahead-untagged';
+    }
+    siblings.push({
+      name: siblingPkg.name,
+      dir: siblingDir,
+      ...state,
+      mirrorVersion: mirror.version,
+      drift,
+    });
+  }
+  return siblings;
+}
+
+/**
+ * Collect the release-critical git state for a project root plus any bundled
+ * sibling mirrors. Returns null (callers omit the block) when the root yields
+ * no git state. `execGit` / `cacheMs` / `now` are test seams only — production
+ * callers pass just the directory.
+ */
+export function collectRepoState(projectDir, {
+  execGit = defaultExecGit,
+  cacheMs = CACHE_MS,
+  now = Date.now,
+} = {}) {
+  if (!projectDir) return null;
+  let dir;
+  try {
+    dir = path.resolve(String(projectDir));
+  } catch {
+    return null;
+  }
+  const startedAt = now();
+  const hit = repoStateCache.get(dir);
+  if (hit && cacheMs > 0 && startedAt - hit.at < cacheMs) return hit.state;
+  const git = makeGit(execGit);
+  let state = null;
+  try {
+    const root = repoStateForDir(git, dir);
+    if (root) {
+      state = {
+        ...root,
+        // Additive (1.70.0): the release baseline for the zero-config release
+        // advisory. Root repo only — siblings keep their per-version probe.
+        latestReleaseTag: latestReleaseTag(git, dir, readPackage(dir)?.name || null),
+        siblings: detectSiblings(git, dir),
+        durationMs: Math.max(0, now() - startedAt),
+      };
+    }
+  } catch {
+    state = null;   // belt-and-braces: no probe failure may fail a sync
+  }
+  repoStateCache.set(dir, { at: startedAt, state });
+  return state;
+}
+
+// One advisory line per sibling whose working tree is ahead at an UNRELEASED
+// version — the exact 2026-08-14 shape. Prose is the courtesy channel; the
+// structured block is the contract (renderers must parse repoState, not this).
+export function repoStateWarnings(repoState) {
+  return (repoState?.siblings || [])
+    .filter((sibling) => sibling.drift === 'sibling-ahead-untagged')
+    .map((sibling) => `KLYPIX repo-state warning: sibling checkout ${sibling.dir}`
+      + ` (${sibling.name} ${sibling.packageVersion}${sibling.branch ? `, branch ${sibling.branch}` : ''})`
+      + ` is ahead of the bundled packages/${sibling.name} mirror (${sibling.mirrorVersion})`
+      + ' and its version has NO release tag — a bundle sync or build from this state would ship'
+      + ` an unreleased ${sibling.name}. Verify release state before building.`);
+}

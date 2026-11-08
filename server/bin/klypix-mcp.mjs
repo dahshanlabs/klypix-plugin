@@ -1,0 +1,135 @@
+#!/usr/bin/env node
+// Stable KLYPIX MCP entry point.
+//
+// CLI verbs still execute directly. A normal stdio launch stays attached to the
+// host for the life of the session and delegates protocol work to a replaceable
+// worker. Installed brain-core updates can therefore be validated and activated
+// without asking Codex, Claude, Cursor, or another MCP host to restart.
+
+import path from 'path';
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PKG_VERSION = (() => {
+  try { return createRequire(import.meta.url)('../package.json').version; }
+  catch {
+    // The flattened ~/.claude/project-brain bundle bakes this literal.
+    return '0.0.0';
+  }
+})();
+
+// `check` is two commands behind one verb: flags only (`--staged`, `--base B`,
+// `--install-hook`, …) runs the project rules; one or more named files asks
+// whether a LIVE session is working on them (bin/klypix-check.mjs). The value
+// flags of the rules check are skipped so `check --base origin/main` is never
+// read as `check <file>`.
+const RULES_VALUE_FLAGS = new Set(['--base', '--head', '--range', '--hook', '--project']);
+const namesFiles = (argv) => {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (RULES_VALUE_FLAGS.has(token)) { i++; continue; }
+    if (token === '--') return argv.length > i + 1;
+    if (!token.startsWith('-')) return true;
+  }
+  return false;
+};
+
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions', 'rescue', 'check', 'rules']);
+
+const USAGE = [
+  `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
+  '',
+  'Verbs:',
+  '  install [--force] [--codex-hooks]   set up everything: machine engine + Claude hooks, then THIS project —',
+  '          [--no-project] [--json]     brain, config for the editors you actually have, merge driver, verified',
+  '          [--tools core|all|a,b,c]    which MCP tools the entries it writes register (KLYPIX_TOOLS): a NEW entry',
+  '                                      gets `core` (6 tools) by default; an existing entry keeps its setting (none = all)',
+  '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
+  '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
+  '  sessions [--json]                   closed agent sessions of this project and the notes waiting for them',
+  '  sessions reopen <id> [--quiet]      reopen one (Claude Code / Codex) in a new terminal so its waiting notes reach it',
+  '  runtime [--json] [--watch seconds]  passive MCP process/RAM attribution; never terminates a process',
+  '  conformance [--json]                launch two real MCP clients against this build',
+  '  bench [--quick] [--json] [--out F]  reproducible benchmark: concurrent-write safety, latency, soak, crash',
+  '  init                                seed a starter ./brain.klypix + print an MCP config',
+  '  garden-code [brain]                 print the human approval code for brain_garden',
+  '  check [--staged|--base B|--range A..B] [--strict] [--json]',
+  '                                      run this project\'s rules (.klypix/rules.json) on a diff — milliseconds, no install/tests',
+  '  check --install-hook|--remove-hook  opt-in git pre-commit/pre-push/post-commit hooks for those rules',
+  '  check [--json] [--quiet] <files...> is another LIVE session working on these files right now? exit 0 clear,',
+  '                                      1 overlap (a heads-up, not a lock), 2 cannot answer — for hooks and CI; read-only',
+  '  rules [list|code promote|retire <ids>|promote|retire <ids> --code C|allow <id> --reason R|false-alarm <id> --reason R]',
+  '                                      the human side of rules: approval codes, one-hour overrides, false alarms',
+  '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
+  '  git-driver [install|status] [repo]  register the card-level .klypix merge driver for a repo (zero-command teams)',
+  '  git-hook [install|remove|status]    wire the agent-neutral commit-capture hook (any agent/branch/worktree → brain cards)',
+  '  brain-history [list|restore <id>]   restore points for this brain — undo an accidental delete, edit, or overwrite',
+  '  brain-deleted [list|restore|purge]  recycle bin for this brain — cards you deleted, kept recoverable',
+  '  rescue [list|show <id>|restore <id> [paths…]|prune]',
+  '                                      copies of uncommitted files KLYPIX saved before a git command could discard them',
+  '  orphans [brain] [--apply|--areas]   orphan gardener backfill: report unconnected cards, link the confident subset (dry-run default)',
+  '  diff [ref] [--brain <path>]         readable brain diff vs a git ref (default HEAD) — markdown to stdout',
+  '  pr-brief [baseRef] [--brain <path>] brain decisions touching the files changed since baseRef — PR-comment markdown',
+  '',
+  'With no verb (or any --flag, e.g. --vault <dir>) it runs as an MCP stdio server.',
+].join('\n');
+
+const verb = process.argv[2];
+if (verb === '--help' || verb === '-h' || verb === 'help') {
+  console.log(USAGE);
+  process.exit(0);
+}
+// A bare unknown WORD used to fall through to the stdio server, which then sat
+// waiting on a stdin that no host was driving — so `npx klypix-mcp uninstall`
+// (or any typo) printed nothing and exited 0, indistinguishable from success.
+// Only non-dash tokens are rejected: a real host launch is `--vault <dir>`,
+// and the local-bundle launch form puts '--vault' at argv[2] too.
+if (verb && !verb.startsWith('-') && !DIRECT.has(verb)) {
+  console.error(`klypix-mcp: unknown command "${verb}".\n\n${USAGE}`);
+  process.exit(2);
+}
+
+if (verb === 'bench') {
+  const { runBenchmark, formatBenchmark } = await import('../src/bench.mjs');
+  const quick = process.argv.includes('--quick');
+  const report = await runBenchmark({ quick });
+  const outIdx = process.argv.indexOf('--out');
+  const markdown = formatBenchmark(report);
+  if (outIdx >= 0 && process.argv[outIdx + 1]) {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(process.argv[outIdx + 1], `${markdown}\n`);
+  }
+  console.log(process.argv.includes('--json') ? JSON.stringify(report, null, 2) : markdown);
+  const c = report.scenarios?.concurrentWriters;
+  process.exit(c?.verdict === 'no-loss' ? 0 : 1);
+} else if (verb === 'check' && namesFiles(process.argv.slice(3))) {
+  // `check <files...>` is the live-overlap answer (bin/klypix-check.mjs);
+  // `check` with flags only stays the rules check below. Same sub-bin contract
+  // as runVerb: splice the verb so the bin sees the standalone argv shape.
+  process.argv.splice(2, 1);
+  try {
+    await import('./klypix-check.mjs');
+  } catch (error) {
+    // The flattened ~/.claude/project-brain bundle stages this dispatcher but
+    // not the check bin (see runVerb in klypix-worker.mjs for the same case).
+    if (error?.code !== 'ERR_MODULE_NOT_FOUND' || !String(error?.message || '').includes('klypix-check.mjs')) throw error;
+    console.error('klypix: `check <files>` is not available in this installed bundle — run `npx klypix-mcp check <files>` from the npm package instead.');
+    process.exit(2);
+  }
+} else if (verb === 'check' || verb === 'rules') {
+  const { runRulesCli } = await import('../src/brain-rules.mjs');
+  process.exit(await runRulesCli(verb === 'rules' ? process.argv.slice(2) : process.argv.slice(3)));
+} else if (verb === 'runtime') {
+  process.argv.splice(2, 1);
+  await import('./klypix-runtime.mjs');
+} else if (DIRECT.has(verb)) {
+  await import('./klypix-worker.mjs');
+} else {
+  const { runMcpSupervisor } = await import('../src/mcp-supervisor.mjs');
+  await runMcpSupervisor({
+    fallbackWorker: path.join(HERE, 'klypix-worker.mjs'),
+    fallbackVersion: PKG_VERSION,
+    workerArgs: process.argv.slice(2),
+  });
+}
